@@ -1,0 +1,1124 @@
+---
+title: "Connecting gene modules identified within different epilepsy cohorts"
+author: "Liesbeth François"
+date: "`r format(Sys.time(), '%B %d %Y')`"
+output: 
+   html_document: 
+     self_contained: yes
+     fig_height: 6
+     fig_width: 8
+     keep_md: yes
+     number_sections: yes
+     theme: cerulean
+     toc: yes
+     toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=F, eval = T, include=F}
+rm(list=ls())
+gc() 
+library(knitr)
+library(kableExtra)
+opts_chunk$set(
+   include=FALSE,
+   warning=FALSE, echo=FALSE, message=FALSE,
+   concordance=TRUE
+)
+##
+library(beeswarm)
+library(BiocParallel)
+library(DT)
+library(edgeR)
+library(ggplot2)
+library(here)
+library(limma)
+library(MASS)
+library(openxlsx)
+library(plotly)
+library(RColorBrewer)
+library(readxl)
+library(scales)
+library(tibble)
+library(tximport)
+library(CRAFT)
+library(reshape2)
+library(WGCNA)
+library(ggrepel)
+library(UpSetR)
+library(cluster)
+library(gplots)
+library(pheatmap)
+library(CoReMo)
+library(lme4)
+library(ggpubr)
+library(rlist)
+library(dplyr)
+library(BED)
+library(heatmaply)
+library(factoextra)
+library(NbClust)
+library(fgsea)
+library(reactable)
+library(stringr)
+```
+
+# Comparison of shared mechanisms across epilepsies
+
+```{r}
+load(here("Data/06_Modules/HS/Conservation/HS_ConservationResults.rda"))
+all_cross <- crosstabulation 
+## as the different cortex control samples are used for TSC, FCD2b and mTOR, they are not really independent results. We take the control assessment of mTOR, which includes all relevant controls for these conditions.
+all_cons <- conservation %>% 
+  filter(Condition %in% c("HS_disease","mTOR_disease", "TSC_disease", 
+                          "FCD2b_disease", "FCD 2a", 
+                          "HS_control", "mTOR_control")) 
+##
+load(here("Data/06_Modules/TSC/Conservation/TSC_ConservationResults.rda"))
+all_cross <- crosstabulation %>% 
+  bind_rows(all_cross)
+all_cons <- conservation %>% 
+  filter(Condition %in% c("HS_disease","mTOR_disease", "TSC_disease", 
+                          "FCD2b_disease", "FCD 2a", 
+                          "HS_control", "mTOR_control"))  %>% 
+  bind_rows(all_cons)
+
+##
+load(here("Data/06_Modules/mTOR/Conservation/mTOR_ConservationResults.rda"))
+all_cross <- crosstabulation %>% 
+  bind_rows(all_cross)
+all_cons <- conservation %>% 
+  filter(Condition %in% c("HS_disease","mTOR_disease", "TSC_disease", 
+                          "FCD2b_disease", "FCD 2a", 
+                          "HS_control", "mTOR_control"))  %>% 
+  bind_rows(all_cons)
+
+##
+load(here("Data/06_Modules/FCD2b/Conservation/FCD2b_ConservationResults.rda"))
+all_cross <- crosstabulation %>% 
+  bind_rows(all_cross)
+all_cons <- conservation %>% 
+  filter(Condition %in% c("HS_disease","mTOR_disease", "TSC_disease", 
+                          "FCD2b_disease", "FCD 2a", 
+                          "HS_control", "mTOR_control"))  %>% 
+  bind_rows(all_cons)
+
+all_cross1 <- all_cross %>% 
+  mutate(m = paste(pmin(Module, `External module`), 
+                   pmax(Module, `External module`), 
+                   sep = "|")) %>% 
+  filter(Project == "AMC") %>% 
+  filter(Condition %in% c("HS_disease","mTOR_disease", "TSC_disease", 
+                          "FCD2b_disease", "FCD 2a", 
+                          "HS_control", "mTOR_control")) %>%  
+  filter(!Module == `External module`) %>% 
+  arrange(`P-Value`) 
+```
+
+```{r, include = TRUE, plotly = TRUE}
+toPlot <- all_cons %>% 
+  select(Module, Condition, p.value)
+toPlot <- reshape2::dcast(toPlot, Condition~Module)
+rownames(toPlot) <- toPlot[,1]
+toPlot <- toPlot[,-1]
+toPlot <-  data.matrix(toPlot)
+toPlot[toPlot <= 0.0001] <- 0.0001
+toPlot[toPlot > 0.05] <- 1
+toPlot[is.na(toPlot)] <- 1
+toPlot <- -log10(toPlot)
+# dim(toPlot)
+# Remove modules which are never conserved
+toRem <- which(apply(toPlot, 2, function(x){sum(x)}) == 0)
+toPlot <- toPlot[,-toRem]
+
+heatmaply::heatmaply(toPlot, 
+                     show_dend=c(TRUE, TRUE), 
+                     hclust_method = "ward.D",
+                     colors = viridis::viridis(n=256, 
+                                               alpha = 1, 
+                                               begin = 0, 
+                                               end = 1,
+                                               option = "cividis"),
+                     k_col = 5,
+                     fontsize_row = 5, 
+                     fontsize_column = 5)  %>%
+  layout(width = 1200)
+```
+
+# Identifying subclusters {.tabset}
+
+## Clustering
+
+```{r}
+scope <- list(be = "Gene",
+                source = "Ens_gene",
+                organism = "human")
+moduleList <- do.call(focusOnScope, c(
+    list(
+      x=getBekBeids(
+        names = unique(all_cons$Module)),
+      force=FALSE
+    ),
+    scope
+  ))
+names(moduleList) <- metadata(moduleList)$name
+x <- lhclust(moduleList, distMeth = "inclusion", hcMeth = "ward.D2")
+plot(x)
+
+distMeth = "inclusion"
+toPlot <- do.call(cbind, lapply(moduleList, function(z) {
+        unlist(lapply(moduleList, function(y) {
+            if (distMeth == "inclusion") {
+                return(length(intersect(z, y))/min(length(z), 
+                  length(y)))
+            }
+            if (distMeth == "jaccard") {
+                return(length(intersect(z, y))/length(union(z, 
+                  y)))
+            }
+        }))
+    }))
+
+```
+
+```{r, include= TRUE}
+p1 <- heatmaply(toPlot,
+                 show_dend=c(TRUE, TRUE),
+                 hclust_method = "ward.D2",
+                show_dendrogram = c(FALSE,TRUE),
+                 fontsize_row = 6,
+                 fontsize_column = 6) 
+p1
+```
+
+```{r, include=  TRUE}
+# ## Elbow method
+fviz_nbclust(toPlot, FUN = hcut,
+             # hc_func = c("hclust"),
+             # hc_method = "ward.D2", 
+             method = "wss", 
+             k.max = 100)
+```
+
+## Subclusters
+
+```{r, include = TRUE}
+## Targets
+hc <- hclust(dist(1-toPlot), method = "ward.D2")
+plot(hc)
+subcluster <- cutree(hc, k = 29) ##52
+rect.hclust(hc,k = 29, border=2:4)
+```
+
+```{r, include = TRUE}
+stacked_subcluster <- stack(subcluster) %>% 
+  mutate_if(is.factor, as.character) %>% 
+  select(module = ind, group = values) %>% 
+  arrange(group)
+a <- stacked_subcluster %>% 
+  inner_join(diffco_all, by = c("module" = "Module"))
+print(stacked_subcluster)
+```
+
+```{r}
+lstacked_subcluster <- split(x = stacked_subcluster, 
+                            f = stacked_subcluster$group)
+
+subcluster_enr <- lapply(lstacked_subcluster,
+                      function(i){
+  scope <- list(be = "Gene",
+                source = "Ens_gene",
+                organism = "human")
+  ml <- do.call(focusOnScope, c(
+    list(
+      x=getBekBeids(
+        names = pull(i,module)),
+      force=FALSE
+    ),
+    scope
+  ))
+  names(ml) <- metadata(ml)$name
+    
+  nbCond <- length(unique(gsub("[.].*", "", names(ml))))
+  
+  toRet <- stack(ml) %>% 
+    mutate_if(is.factor, as.character) %>% 
+    as_tibble() %>% 
+    add_count(values) %>% 
+    filter(n >= nbCond & n > 1) %>%
+    pull(values) %>%
+    unique()
+})
+```
+
+
+## Functional annotation {.tabset}
+
+
+```{r}
+bescope <- list(be = "Gene",
+                source = "Ens_gene",
+                organism = "human")
+toTest <- rlist::list.flatten(subcluster_enr)
+gn <- getBeIdDescription(stack(toTest)$values,  
+                  be = "Gene", source = "Ens_gene", organism = "human")
+eg <- unlist(do.call(focusOnScope, c(
+    list(
+      x=getBekBeids(analysisProjects = "AMC", type = "Background"),
+      force=FALSE
+    ),
+    bescope
+  )))
+```
+
+### MetaBase pathway maps
+
+```{r}
+faFile <- here("Data", "10_CohortComparison/FunctionalAnnotation-crosstabCluster_inclusionstringent.rda")
+if(file.exists(faFile)){
+  load(faFile)
+}else{
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="MetaBase_pathway",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- TBTools::qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resMB <- res %>% 
+    mutate(type = "MetaBase_pathway") %>%
+    inner_join(metadata(fl) %>% select("externalID", name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="https://portal.genego.com/cgi/imagemap.cgi?id=%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+  
+    # Add list of genes intersect
+  resMB$Intersect_genes <- apply(as.data.frame(resMB), 1, function(x){
+      g <- intersect(toTest[[x["uuid"]]], fl[[x["ruuid"]]])
+      paste(gn$symbol[match(g, gn$id)], collapse = ", ")
+    })
+}
+```
+
+```{r, include = FALSE}
+datatable(resMB %>%
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+```{r, eval=TRUE, include = TRUE}
+toShow <- resMB %>%
+    filter(FDR <= 0.05) %>%
+    mutate(Module = paste0("C", uuid)) %>%
+    select(Module = Module,
+           `Module size` = query,
+           Concept = name,
+           `Concept size` = reference,
+           Intersect = intersection,
+           FDR,
+           `Relative rank` = relRank, 
+           Intersect_genes, 
+           ruuid) %>%
+    mutate(Module = as.factor(Module),
+           Concept = as.factor(Concept)) %>% 
+  as.data.frame()
+```
+
+### Reactome pathways
+
+```{r}
+if(!file.exists(faFile)){
+ nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="Reactome_pathways_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resRA <- res %>% 
+    mutate(type = "Reactome_pathways_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://www.reactome.org/PathwayBrowser/#/%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+  
+      # Add list of genes intersect
+  resRA$Intersect_genes <- apply(as.data.frame(resRA), 1, function(x){
+      g <- intersect(toTest[[x["uuid"]]], fl[[x["ruuid"]]])
+      paste(gn$symbol[match(g, gn$id)], collapse = ", ")
+    })
+}
+```
+
+```{r, include = FALSE}
+datatable(resRA %>%
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank)%>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+```{r, eval=TRUE, include = TRUE}
+toShow <- resRA %>%
+    filter(FDR <= 0.05) %>%
+    mutate(Module = paste0("C", uuid)) %>%
+    select(Module = Module,
+           `Module size` = query,
+           Concept = name,
+           `Concept size` = reference,
+           Intersect = intersection,
+           FDR,
+           `Relative rank` = relRank, 
+           Intersect_genes, 
+           ruuid) %>%
+    mutate(Module = as.factor(Module),
+           Concept = as.factor(Concept)) %>% 
+  as.data.frame()
+```
+
+### Gene Ontology: biological process
+
+```{r}
+if(!file.exists(faFile)){
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="GO_biological_process_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resGOBP <- res %>% 
+    mutate(type = "GO_biological_process_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://amigo.geneontology.org/amigo/term/GO:%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+  
+      # Add list of genes intersect
+  resGOBP$Intersect_genes <- apply(as.data.frame(resGOBP), 1, function(x){
+      g <- intersect(toTest[[x["uuid"]]], fl[[x["ruuid"]]])
+      paste(gn$symbol[match(g, gn$id)], collapse = ", ")
+    })
+}
+```
+
+```{r, include = FALSE}
+datatable(resGOBP %>%             
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+```{r, eval=TRUE, include = TRUE}
+toShow <- resGOBP %>%
+    filter(FDR <= 0.05) %>%
+    mutate(Module = paste0("C", uuid)) %>%
+    select(Module= Module,
+           `Module size` = query,
+           Concept = name,
+           `Concept size` = reference,
+           Intersect = intersection,
+           FDR,
+           `Relative rank` = relRank, 
+           Intersect_genes, 
+           ruuid) %>%
+    mutate(Module = as.factor(Module),
+           Concept = as.factor(Concept)) %>% 
+  as.data.frame()
+```
+
+### Gene Ontology: molecular function
+
+```{r}
+if(!file.exists(faFile)){
+
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="GO_molecular_function_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resGOMF <- res %>% 
+    mutate(type = "GO_molecular_function_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://amigo.geneontology.org/amigo/term/GO:%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+  
+      # Add list of genes intersect
+  resGOMF$Intersect_genes <- apply(as.data.frame(resGOMF), 1, function(x){
+      g <- intersect(toTest[[x["uuid"]]], fl[[x["ruuid"]]])
+      paste(gn$symbol[match(g, gn$id)], collapse = ", ")
+    })
+}
+```
+
+```{r, include = FALSE}
+datatable(resGOMF %>%          
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+```{r, eval=TRUE, include = TRUE}
+toShow <- resGOMF %>%
+    filter(FDR <= 0.05) %>%
+    mutate(Module = paste0("C", uuid)) %>%
+    select(Module = Module,
+           `Module size` = query,
+           Concept = name,
+           `Concept size` = reference,
+           Intersect = intersection,
+           FDR,
+           `Relative rank` = relRank, 
+           Intersect_genes, 
+           ruuid) %>%
+    mutate(Module = as.factor(Module),
+           Concept = as.factor(Concept)) %>% 
+  as.data.frame()
+
+```
+
+### Gene Ontology: cellular component
+
+```{r}
+if(!file.exists(faFile)){
+
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="GO_cellular_component_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resGOCC <- res %>% 
+    mutate(type = "GO_cellular_component_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://amigo.geneontology.org/amigo/term/GO:%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+  
+      # Add list of genes intersect
+  resGOCC$Intersect_genes <- apply(as.data.frame(resGOCC), 1, function(x){
+      g <- intersect(toTest[[x["uuid"]]], fl[[x["ruuid"]]])
+      paste(gn$symbol[match(g, gn$id)], collapse = ", ")
+    })
+}
+```
+
+```{r, include = FALSE}
+datatable(resGOCC %>%              
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+```{r, eval=TRUE, include = TRUE}
+toShow <- resGOCC %>%
+    filter(FDR <= 0.05) %>%
+    mutate(Module = paste0("C", uuid)) %>%
+    select(Module = Module,
+           `Module size` = query,
+           Concept = name,
+           `Concept size` = reference,
+           Intersect = intersection,
+           FDR,
+           `Relative rank` = relRank, 
+           Intersect_genes, 
+           ruuid) %>%
+    mutate(Module = as.factor(Module),
+           Concept = as.factor(Concept)) %>% 
+  as.data.frame()
+```
+
+### PangloaDB cell type biomarkers
+
+```{r}
+if(!file.exists(faFile)){
+  tkcon <- chTKCat(password = "")
+  pangloadb <- get_MDB(tkcon,"PanglaoDB")
+  fl <- inner_join(pangloadb$PanglaoDB_Markers,
+                   pangloadb$PanglaoDB_Genes %>% select(symbol, ensembl),
+                   by = c("symbol")) %>% 
+    inner_join(pangloadb$PanglaoDB_CellTypes %>% select(`cell type`, organ),
+               by = c("cell type")) %>% 
+    filter(grepl("ENSG", ensembl))
+  sfl <- split(fl$ensembl, fl$`cell type`)
+  
+  res <- qrlEnrich(
+     query=toTest, reference=sfl,
+     omega=unlist(eg),
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resPAN <- res %>% 
+    mutate(type = "PangloaDB cell type biomarkers") %>% 
+    mutate(Organ = fl$organ[match(ruuid, fl$`cell type`)])
+  
+      # Add list of genes intersect
+  resPAN$Intersect_genes <- apply(as.data.frame(resPAN), 1, function(x){
+      g <- intersect(toTest[[x["uuid"]]], fl[[x["ruuid"]]])
+      paste(gn$symbol[match(g, gn$id)], collapse = ", ")
+    })
+  
+  
+  save(resMB, resRA, resGOBP, resGOMF, resGOCC, resHB, resPAN,
+     file = faFile)
+}
+```
+
+```{r, include = FALSE}
+datatable(resPAN %>%        
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = ruuid,
+                   Organ,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+```{r, eval=TRUE, include = TRUE}
+toShow <- resPAN %>%
+    filter(FDR <= 0.05) %>%
+  filter(Organ == "Brain") %>% 
+    mutate(Module = paste0("C", uuid)) %>%
+    select(Module = Module,
+           `Module size` = query,
+           Concept = ruuid,
+           Organ,
+           `Concept size` = reference,
+           Intersect = intersection,
+           FDR,
+           `Relative rank` = relRank, 
+           Intersect_genes) %>%
+    mutate(Module = as.factor(Module),
+           Concept = as.factor(Concept)) %>% 
+  as.data.frame()
+
+
+reactable(toShow %>% 
+            mutate_if(is.numeric, signif, 2),
+          filterable=TRUE,
+          resizable=TRUE, 
+          wrap=FALSE,
+          fullWidth=TRUE,
+          defaultSorted = c("FDR"),
+          columns = list(
+             Module=colDef(width=100),
+             Concept = colDef(width=450)
+            ),
+           details = function(index){
+             x <- toShow[index,] %>% 
+               pull(Intersect_genes) %>% 
+               str_split(", ") %>% 
+               unlist()
+             toShow2 <- tibble(Gene = x, 
+                              Ens_gene = gn$id[match(x, gn$symbol)])
+             htmltools::div(
+                reactable(toShow2, 
+                          columns = list(
+                             Ens_gene = colDef(cell = function(value, index) {
+                                  # Render as a link
+                                  url <- sprintf("http://www.ensembl.org/id/%s", 
+                                                 value)
+                                  htmltools::tags$a(href = url, target = "_blank", as.character(value))
+                                }))
+                          )
+                )
+           }
+          )
+
+```
+
+## Gene content
+
+```{r}
+ann <- bind_rows(resMB, resPAN, resRA, resGOBP, resGOMF) %>% 
+  rename(module = uuid)
+
+pathway_preference <- c("PangloaDB cell type biomarkers", "Reactome_pathways_human",
+                        "MetaBase_pathway", "GO_biological_process_human",
+                        "GO_molecular_function_human" )
+pathway_preference <- factor(pathway_preference,
+                        levels = c("PangloaDB cell type biomarkers",
+                                   "Reactome_pathways_human",
+                        "MetaBase_pathway", "GO_biological_process_human",
+                        "GO_molecular_function_human" ))
+
+
+toRet1 <- ann %>% dplyr::group_by(module) %>% 
+  dplyr::filter(FDR <= 0.05) %>% dplyr::top_n(n = 1, 
+  wt = relRank) %>% dplyr::ungroup() %>% dplyr::select(module = module, 
+  concept = name, externalID = ruuid, type, rank, 
+  relRank, `p-value`, FDR, modSize = query, conceptSize = reference, intersection)
+toRet1 <- toRet1 %>% 
+  dplyr::filter(type %in% pathway_preference) %>% 
+  dplyr::mutate(type = factor(type, level = levels(pathway_preference))) %>% 
+  dplyr::arrange(type) %>% 
+  dplyr::distinct(module, .keep_all = TRUE) %>% 
+  dplyr::mutate(type = as.character(type))
+
+
+annotation_cluster <- toRet1 %>% 
+  dplyr::mutate(geneId = NA_character_, geneSymbol = NA_character_, 
+                geneName = NA_character_) %>% 
+  dplyr::select(module, geneId, geneSymbol, geneName, 
+                pathwayId = externalID, pathwayName = concept, 
+                pathwayResource = type) %>% 
+  mutate(pathway = case_when(is.na(pathwayName) ~ pathwayId,
+                             TRUE ~ pathwayName))
+
+toShow <- stack(subcluster_enr) %>% 
+  as_tibble()
+toShow <- inner_join(toShow,
+                     annotation_cluster,
+                     by = c("ind" = "module")) %>% 
+  inner_join(getBeIdDescription(ids = .$values, be = "Gene", source = "Ens_gene", 
+                                organism = "human"),
+             by = c("values" = "id")) %>% 
+  mutate(Gene = paste0(sprintf('<a href="%s" target="_blank">%s</a>',
+                                    getBeIdURL(values, 
+                                               databases = "Ens_gene"),
+                                    symbol)))
+```
+
+```{r, include = TRUE}
+datatable(toShow %>% select(Cluster = ind, 
+                            Gene, name, 
+                            pathway,   
+                            pathwayResource),
+          escape = FALSE,
+          rownames = FALSE,
+          filter = 'top',
+          fillContainer = FALSE)
+```
+
+## Common TF per cluster {.tabset}
+
+```{r, include = TRUE, results='asis', plotly = TRUE, fig.width = 10, fig.height = 15, echo = FALSE}
+hpa <- get_MDB(tkcon, "HPA")
+
+modules_data_plot <- list()
+
+for(i in 1:max(stacked_subcluster$group)){
+  toSel <- (stacked_subcluster %>% filter(group == i) %>% pull(module))
+  x <- all_cross1 %>%
+        filter(Module %in%  toSel & 
+                 `External module` %in% toSel) %>%
+        arrange(`P-Value`) %>%
+        filter(`P-Value` <= 0.05) %>% 
+        filter(Module != `External module`) %>%
+        distinct()
+  common_regulators <- all_modules %>% 
+    filter(uuid %in% toSel) %>% 
+    arrange(`p-value`) %>% 
+    distinct(uuid, value, .keep_all = T) %>% 
+    add_count(value) 
+  reg <- common_regulators %>% 
+    filter(n == max(n) & n > 1) %>% 
+    mutate(col = case_when(impact == "Activation" ~ "#1a9850",
+                       TRUE ~ "#d73027")) %>% 
+    mutate(gene = getBeIdDescription(ids = value, 
+                                     be = "Object", 
+                                     source = "MetaBase_object", 
+                                     organism = "human")$symbol)
+
+  col <- c("TSC" = "#d95f02",
+             "mTOR" = "#7570b3",
+             "FCD2b" = "#e7298a", 
+             "HS" = "#66a61e")
+
+  
+  nodes <- all_cross %>% 
+    filter(Module %in% toSel) %>% 
+    select(id = Module, module = `Module size`, label = Module, Condition)  %>% 
+    mutate(Condition = gsub("[.].*", "", id)) %>%
+    arrange(desc(module)) %>% 
+    distinct(id, .keep_all = TRUE) %>%
+    mutate(color = col[Condition],
+           group = "Module") %>% 
+    bind_rows(tibble(id = unique(pull(reg, gene)),
+                     module = NA,
+                     label = id,
+                     Condition = NA_character_,
+                     group = "Regulator",
+                     color = "#b3cde3"))  %>% 
+    distinct()
+  edges <- x %>% 
+    filter(intersect != 0) %>%
+    mutate(label = intersect) %>%
+    mutate(perc = round(intersect*2/(`Module size` + `External size`), 2)) %>% 
+    mutate(m = paste(pmin(Module, `External module`), pmax(Module, `External module`),
+                     sep = "_"),
+           color = "#878787") %>% 
+    distinct(m, .keep_all = T) %>% 
+    select(from = Module, to = `External module`, label = perc, title = intersect, color) %>% 
+    distinct() %>% 
+    bind_rows(tibble(from = reg$gene,
+                     to = reg$uuid,
+                     label = reg$intersection,
+                     title = reg$intersection,
+                     color = reg$col,
+                     arrows = "to"))  %>% 
+    distinct()
+  
+  modules_data_plot[[i]] <- list(nodes = nodes,
+                                 edges = edges,
+                                 gene_overlap_modules = x,
+                                 common_regulators = common_regulators) 
+  
+  cat(sprintf("\n\n### Cluster %s\n\n", i))
+  cat("\n\n")
+  print(htmltools::tagList(
+    visNetwork(nodes = nodes, 
+             edges = edges, randomSeed =111) %>% 
+      visPhysics(solver = "forceAtlas2Based", 
+                 forceAtlas2Based = list(gravitationalConstant = -50)) %>% 
+        # darkblue square with shadow for group "A"
+      visGroups(groupname = "Module", shape = "round", 
+                shadow = list(enabled = TRUE)) %>% 
+      # red triangle for group "B"
+      visGroups(groupname = "Regulator", shape = "triangle") 
+  ))
+  cat("\n\n")
+}
+names(modules_data_plot) <- sort(unique(stacked_subcluster$group))
+save(modules_data_plot, 
+       file = here("Data/14_Main_Manuscript_Figures/shared_modules_network_data.rda"))
+```
+
+```{r}
+visNetwork(nodes = nodes, 
+             edges = edges, randomSeed =111) %>% 
+  visPhysics(solver = "forceAtlas2Based", 
+             forceAtlas2Based = list(gravitationalConstant = -50)) %>% 
+    # darkblue square with shadow for group "A"
+  visGroups(groupname = "Module", shape = "round", 
+            shadow = list(enabled = TRUE)) %>% 
+  # red triangle for group "B"
+  visGroups(groupname = "Regulator", shape = "triangle")   
+```
+
+## Conservation of regulation in other epilepsies and healthy tissue
+
+```{r, include = TRUE}
+toShow <- all_cons %>% 
+  select(-Project) %>% 
+  mutate(Cluster = stacked_subcluster$group[match(Module, 
+                                                  stacked_subcluster$module)]) %>% 
+  arrange(Cluster) %>% 
+  select(-R2, -p.value) %>% 
+  tidyr::pivot_wider(names_from = Condition, values_from = FDR)
+```
+
+```{r}
+mb <- resMB %>% 
+  group_by(uuid) %>% 
+  filter(FDR <= 0.05) %>% 
+  arrange(FDR) %>% 
+  slice(1:2) %>% 
+  summarize(pw = paste(name, collapse = " | \n")) %>% 
+  ungroup()
+ra <- resRA %>% 
+  group_by(uuid) %>% 
+  filter(FDR <= 0.05) %>% 
+  arrange(FDR) %>% 
+  slice(1:2) %>% 
+  summarize(pw = paste(name, collapse = " | \n")) %>% 
+  ungroup()
+pan <- resPAN %>% 
+  group_by(uuid) %>% 
+  filter(FDR <= 0.05) %>% 
+  arrange(FDR) %>% 
+  slice(1:2) %>% 
+  summarize(pw = paste(ruuid, collapse = " | \n")) %>% 
+  ungroup()
+gobp <- resGOBP %>% 
+  group_by(uuid) %>% 
+  filter(FDR <= 0.05) %>% 
+  arrange(FDR) %>% 
+  slice(1:2) %>% 
+  summarize(pw = paste(name, collapse = " | \n")) %>% 
+  ungroup()
+gomf <- resGOMF %>% 
+  group_by(uuid) %>% 
+  filter(FDR <= 0.05) %>% 
+  arrange(FDR) %>% 
+  slice(1:2) %>% 
+  summarize(pw = paste(name, collapse = " | \n")) %>% 
+  ungroup()
+
+toWrite <- toShow %>% 
+  left_join(diffco_all,
+             by = c("Module")) %>% 
+  rename("FCD2a_disease" = "FCD 2a",
+         Cortex_control = mTOR_control, 
+         Hippocampus_control = HS_control) %>% 
+  mutate(MetaBase = mb$pw[match(Cluster, mb$uuid)],
+         Reactome = ra$pw[match(Cluster, ra$uuid)],
+         PangloaDB = pan$pw[match(Cluster, pan$uuid)],
+         GO_BiologicalProcess = gobp$pw[match(Cluster, gobp$uuid)],
+         GO_MolecularFunction = gomf$pw[match(Cluster, gomf$uuid)]) %>% 
+  select(Module, Cluster,
+         14:18,
+         10:13,
+         3:9)
+write.csv(toWrite, 
+          file = here("Data/10_CohortComparison/summary_cohort_comparison.csv"))
+```
+

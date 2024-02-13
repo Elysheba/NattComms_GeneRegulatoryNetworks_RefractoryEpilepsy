@@ -1,0 +1,347 @@
+---
+title: "Discriminant analysis on different epilepsy and healthy cohorts"
+author: "Liesbeth François"
+date: "`r format(Sys.time(), '%B %d %Y')`"
+output: 
+   html_document: 
+     self_contained: yes
+     fig_height: 6
+     fig_width: 8
+     keep_md: yes
+     number_sections: yes
+     theme: cerulean
+     toc: yes
+     toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=F, eval = T, include=F}
+rm(list=ls())
+gc() 
+library(knitr)
+library(kableExtra)
+opts_chunk$set(
+   include=FALSE,
+   warning=FALSE, echo=FALSE, message=FALSE,
+   concordance=TRUE
+)
+##
+library(beeswarm)
+library(DT)
+library(edgeR)
+library(ggplot2)
+library(here)
+library(limma)
+library(MASS)
+library(openxlsx)
+library(plotly)
+library(RColorBrewer)
+library(readxl)
+library(tibble)
+library(reshape2)
+library(ggrepel)
+library(ggpubr)
+library(heatmaply)
+library(factoextra)
+library(NbClust)
+library(adegenet)
+library(dplyr)
+library(ggdendro)
+
+tkcon <- chTKCat(user = "default", password = "")
+pdb <- chTKCat(host="bel038783", port=9311L, user="lfrancois", password=cred) %>%
+  get_MDB("AMC_collaboration", check = FALSE) ## internal database which stores the output of the different coremo analyses for ease of access
+```
+
+```{r}
+## Load sample information from all cohorts
+amc_subjects <- pdb$AMC_subjects 
+amc_samples <- pdb$AMC_samples %>% 
+  inner_join(amc_subjects, by = c("subject")) %>% 
+  filter(subject %in% amc_subjects$subject) %>% 
+  mutate(disease = case_when(disease == "Control" ~ paste(disease, `tissue generic origin`, sep = "_"),
+                             TRUE ~ disease)) %>% 
+  mutate(disease = gsub(paste("Frontal", "Parietal", "Temporal", sep = "|"), "Cortex", disease)) %>% 
+  mutate(Cohort = case_when(disease == "Focal cortical dysplasia type 2a" ~ "FCD IIa",
+                          disease == "Focal cortical dysplasia type 2b" ~ "FCD IIb",
+                          disease == "Tuberous Sclerosis Complex" ~ "TSC",
+                          disease == "Hippocampal Sclerosis" ~ "TLE+HS",
+                          disease == "Control_Cortex" ~ "Cortex",
+                          TRUE ~ "Hippocampus"))
+table(amc_samples$Cohort)
+
+d <-  pdb$AMC_rnaseq[,amc_samples$sample]
+dim(d)
+dim(amc_samples)
+```
+
+# Clustering and dendrogram
+
+```{r,eval=T,include=T,echo=F}
+pca <- prcomp(t(d), center=TRUE, scale.=TRUE)
+hc <- hclust(dist(1-pca$x), method = "ward.D2")
+
+dendrogram_data <- dendro_data(as.dendrogram(hc))
+dendrogram_segments <- dendrogram_data$segments # contains all dendrogram segment data
+dendrogram_ends <- dendrogram_segments %>%
+ filter(yend == 0) %>% # filter for terminal dendrogram ends
+ left_join(dendrogram_data$labels, by = "x") %>% 
+ rename(sample_name = label) %>%
+ left_join(toPlot, by = c("sample_name" = "sample")) %>% 
+  mutate(Cohort = case_when(Cohort == "TLE+HS" ~ "TLE",
+                            TRUE ~ Cohort))
+
+
+unique_vars <- levels(factor(dendrogram_ends$disease)) %>% 
+ as.data.frame() %>% rownames_to_column("row_id") 
+# count number of unique variables
+color_count <- length(unique(unique_vars$.))
+# get RColorBrewer palette
+get_palette <- colorRampPalette(brewer.pal(n = 8, name = "Set1"))
+# produce RColorBrewer palette based on number of unique variables in metadata:
+palette <- get_palette(color_count) %>% 
+ as.data.frame() %>%
+ rename("color" = ".") %>%
+ rownames_to_column(var = "row_id")
+color_list <- left_join(unique_vars, palette, by = "row_id") %>%
+ select(-row_id)
+species_color <- as.character(color_list$color)
+names(species_color) <- color_list$.
+
+cols <- control_palettes(palette = 'Categorical_12_colors')[c(12, 1, 2, 5, 4, 3),] %>% 
+  pull(hex)
+
+p1 <- ggplot() +
+ geom_segment(data = dendrogram_segments, 
+              aes(x=x, y=y, xend=xend, yend=yend)) +
+ geom_segment(data = dendrogram_ends,
+              aes(x=x, y=y.x, xend=xend, yend=yend, 
+                  color = Cohort, 
+                  label = paste('sample name: ', sample_name, 
+                                '<br>', 'species: ', disease))
+              ) + 
+ scale_color_manual(values = cols) +
+ scale_y_reverse() +
+ coord_flip() + 
+ theme_void() + #theme(legend.position = 'none') + 
+ ylab('Distance') +
+ xlab("") + 
+ theme(axis.text=element_blank(), legend.title = element_text(size = 18), 
+       legend.text = element_text(size = 16)) 
+p1
+```
+
+# Discriminant analysis of principal components (DAPC)
+
+In this multivariate statistical approach variance in the sample is partitioned into a between-group and within- group component, in an effort to maximize discrimination between groups. In DAPC, data is first transformed using a principal components analysis (PCA) and subsequently clusters are identified using discriminant analysis (DA). Here DAPC is used in a supervised manner, where the groups (disease cohorts) are provided to perform the discriminant analysis.
+
+More information from [DAPC tutorial](https://grunwaldlab.github.io/Population_Genetics_in_R/DAPC.html)
+
+## All cohorts
+
+```{r, include = T}
+grp <- amc_samples %>% 
+      mutate(disease = case_when(disease == "Focal cortical dysplasia type 2a" ~ "FCD IIa",
+                          disease == "Focal cortical dysplasia type 2b" ~ "FCD IIb",
+                          disease == "Tuberous Sclerosis Complex" ~ "TSC",
+                          disease == "Hippocampal Sclerosis" ~ "TLE-HS",
+                          disease == "Control_Cortex" ~ "Cortex",
+                          TRUE ~ "Hippocampus")) %>% 
+    pull(disease) %>% as.factor() %>% as.numeric()
+names(grp) <- pull(amc_samples, sample)
+
+grp_name <- amc_samples %>% 
+      mutate(disease = case_when(disease == "Focal cortical dysplasia type 2a" ~ "FCD IIa",
+                          disease == "Focal cortical dysplasia type 2b" ~ "FCD IIb",
+                          disease == "Tuberous Sclerosis Complex" ~ "TSC",
+                          disease == "Hippocampal Sclerosis" ~ "TLE-HS",
+                          disease == "Control_Cortex" ~ "Cortex",
+                          TRUE ~ "Hippocampus")) %>% 
+    pull(disease) %>% as.factor() 
+grp_name <- tibble(name = levels(grp_name),
+                   value = 1:6)
+
+if(file.exists(here("Data/12_PLSDA_DAPC/dapc_disease_clusters"))){
+  load(here("Data/12_PLSDA_DAPC/dapc_disease_clusters"))
+}else{
+ dapc <- dapc(t(d), grp = grp, n.pca = 7, n.da = 5)
+ save(dapc, file = "/home/lfrancois/Documents/projects/AMC_collaboration_2019/Data/12_PLSDA_DAPC/dapc_disease_clusters")
+}
+
+# tmp <- optim.a.score(dapc2)
+summary(dapc2)
+
+assigment <- tibble(prior = dapc$grp,
+                     posterior = dapc$assign) %>% 
+  mutate(prior_name = grp_name$name[match(prior, grp_name$value)],
+         post_name = grp_name$name[match(posterior,
+                                         grp_name$value)])
+h <- table(assigment$prior_name, assigment$post_name)
+h <- melt(h) %>% 
+  as_tibble() %>% 
+  mutate(Var2 = factor(Var2,
+                       levels = c("Hippocampus", "TLE-HS", 
+                                  "Cortex", "FCD IIa", "FCD IIb", "TSC")),
+         Var1 = factor(Var1,
+                       levels = c("Hippocampus", "TLE-HS", 
+                                  "Cortex", "FCD IIa", "FCD IIb", "TSC")))
+p2 <- ggplot(h, aes(x = Var1, y = Var2, fill = log10(value), label = value)) +
+  geom_tile( color = "grey") +
+  geom_text() +
+  scale_fill_gradient2(na.value = "white") +
+  labs(x = "Prior assignment", y = "Posterior assignment") + 
+  theme_minimal() +
+  theme(legend.pos = "none", text = element_text(size=14),
+        legend.text = element_text(size = 16),
+        axis.text=element_text(size=20), axis.title = element_text(size=18)) 
+p2
+ggsave(here("Data/12_PLSDA_DAPC/reassignment_all_cohorts.png"))
+
+
+toPlot <- dapc$ind.coord %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "sample") %>% 
+  inner_join(amc_samples %>% select(sample, disease, 
+                                    `tissue generic origin`, age),
+             by = c("sample")) %>% 
+  mutate(grp = dapc$grp[sample]) %>% 
+  as_tibble() %>% 
+  mutate(Cohort = case_when(disease == "Focal cortical dysplasia type 2a" ~ "FCD IIa",
+                          disease == "Focal cortical dysplasia type 2b" ~ "FCD IIb",
+                          disease == "Tuberous Sclerosis Complex" ~ "TSC",
+                          disease == "Hippocampal Sclerosis" ~ "TLE-HS",
+                          disease == "Control_Cortex" ~ "Cortex",
+                          TRUE ~ "Hippocampus"))
+```
+
+```{r}
+cols <- control_palettes(palette = 'Categorical_12_colors')[c(12, 1, 2, 5, 4, 3),] %>% 
+  pull(hex)
+
+p3 <- ggplot(toPlot, aes(x = LD1, y = LD2, col = Cohort)) + 
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(level=0.95) +
+  # scale_color_brewer(palette = "Set2") +
+  scale_color_manual(values=cols) +
+  theme_bw() +
+  theme(legend.pos = "none") +
+  xlab("LD1") +
+  ylab("LD2") +
+  theme(legend.pos = "none", text = element_text(size = 16), 
+        axis.title = element_text(size = 18), axis.text=element_text(size=16))  
+p3
+```
+
+The DAPC shows a clear separation between healthy and disease tissue as well as between mTLE versus the mTORopathies. However, no clear separation could be achieved for the mTORopathies (FCD2a, FCD2b, TSC).
+
+## mTORopathies
+
+```{r}
+grp2 <- amc_samples %>% 
+    filter(disease %in% c("Focal cortical dysplasia type 2a",
+                        "Focal cortical dysplasia type 2b",
+                        "Tuberous Sclerosis Complex")) %>% 
+  mutate(disease = case_when(disease == "Focal cortical dysplasia type 2a" ~ "FCD IIa",
+                          disease == "Focal cortical dysplasia type 2b" ~ "FCD IIb",
+                          disease == "Tuberous Sclerosis Complex" ~ "TSC",
+                          disease == "Hippocampal Sclerosis" ~ "TLE-HS",
+                          disease == "Control_Cortex" ~ "Cortex",
+                          TRUE ~ "Hippocampus")) %>% 
+
+  pull(disease) %>% as.factor() %>% as.numeric()
+
+names(grp2) <- amc_samples %>% 
+  filter(disease %in% c("Focal cortical dysplasia type 2a",
+                        "Focal cortical dysplasia type 2b",
+                        "Tuberous Sclerosis Complex")) %>% 
+  pull(sample)
+
+
+grp_name <- amc_samples %>% 
+  filter(disease %in% c("Focal cortical dysplasia type 2a",
+                        "Focal cortical dysplasia type 2b",
+                        "Tuberous Sclerosis Complex")) %>% 
+  mutate(disease = case_when(disease == "Focal cortical dysplasia type 2a" ~ "FCD IIa",
+                          disease == "Focal cortical dysplasia type 2b" ~ "FCD IIb",
+                          disease == "Tuberous Sclerosis Complex" ~ "TSC")) %>% 
+  pull(disease) %>% as.factor() 
+grp_name <- tibble(name = levels(grp_name),
+                   value = 1:3)
+
+sd <- d[,names(grp2)]
+dapc2 <- dapc(t(sd), grp = grp2, n.pca = 8, n.da = 2)
+
+summary(dapc2)
+
+assigment <- tibble(prior = dapc2$grp,
+                     posterior = dapc2$assign) %>% 
+  mutate(prior_name = grp_name$name[match(prior, grp_name$value)],
+         post_name = grp_name$name[match(posterior,
+                                         grp_name$value)])
+table(assigment$prior_name, assigment$post_name)
+
+h <- table(assigment$prior_name, assigment$post_name)
+h <- melt(h) %>% 
+  as_tibble() %>% 
+  mutate(Var2 = factor(gsub("mTLE", "TLE-HS", Var2),
+                       levels = c("Hippocampus", "TLE-HS", 
+                                  "Cortex", "FCD IIa", "FCD IIb", "TSC")),
+         Var1 = factor(gsub("mTLE", "TLE-HS", Var1),
+                       levels = c("Hippocampus", "TLE-HS", 
+                                  "Cortex", "FCD IIa", "FCD IIb", "TSC")))
+
+p4 <- ggplot(h, aes(x = Var1, y = Var2, fill = log10(value), label = value)) +
+  geom_tile( color = "grey") +
+  geom_text() +
+  scale_fill_gradient2(na.value = "white") +
+  labs(x = "Prior assignment", y = "Posterior assignment") + 
+  theme_minimal() +
+  theme(legend.pos = "none", legend.text = element_text(size = 16),
+         text = element_text(size=14),
+        axis.text=element_text(size=20), axis.title = element_text(size=18)) 
+p4
+ggsave(here("Data/12_PLSDA_DAPC/reassignment_mTORopathies.png"))
+
+
+save(dapc2, 
+     file = "/home/lfrancois/Documents/projects/AMC_collaboration_2019/Data/12_PLSDA_DAPC/dapc_mtor_clusters")
+  
+toPlot <- dapc2$ind.coord %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "sample") %>% 
+  inner_join(amc_samples %>% select(sample, Cohort, 
+                                    `tissue generic origin`, age),
+             by = c("sample")) %>% 
+  mutate(grp = dapc2$grp[sample]) %>% 
+  as_tibble()
+```
+
+```{r}
+cols <- control_palettes(palette = 'Categorical_12_colors')[c(1, 2, 3),] %>%
+  pull(hex)
+p5 <- ggplot(toPlot, aes(x = LD1, y = LD2, col = Cohort)) + 
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(level=0.95) +
+  # scale_color_brewer(palette = "Set2") +
+  scale_color_manual(values=cols) +
+  theme_bw() +
+  theme(legend.pos = "none", text = element_text(size = 16), 
+        axis.title = element_text(size = 18),
+        axis.text=element_text(size=16)) +
+  xlab("LD1") +
+  ylab("LD2")   
+p5
+```
+
+```{r}
+library(ggpubr)
+
+ggarrange(p1, labels = c("A)"),
+          ggarrange(p3, p5, labels = c("B)", "C)"), ncol = 2), 
+          ggarrange(p2, p4, labels = c("D)", "E)"), ncol = 2), 
+          nrow = 3, common.legend = TRUE, legend = "top") %>% 
+  ggexport(filename = here("Data/12_PLSDA_DAPC/combined_plot_dapc_results.png"), 
+           height = 1000, width = 1600)
+```
+

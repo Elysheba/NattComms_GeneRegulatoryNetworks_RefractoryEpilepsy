@@ -1,0 +1,2146 @@
+---
+title: "Systematic transcriptional investigation of epilepsy associated structural abnormalities: towards the identification of novel treatment targets"
+subtitle: "Coregulated gene modules identification in TSC"
+author: "Liesbeth François"
+date: "`r format(Sys.time(), '%B %d %Y')`"
+output: 
+   html_document: 
+     self_contained: yes
+     fig_height: 6
+     fig_width: 8
+     keep_md: yes
+     number_sections: yes
+     theme: cerulean
+     toc: yes
+     toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, echo=F, eval = T, include=F}
+rm(list=ls())
+gc() 
+library(knitr)
+library(kableExtra)
+opts_chunk$set(
+   include=FALSE,
+   warning=FALSE, echo=FALSE, message=FALSE,
+   concordance=TRUE
+)
+
+library(beeswarm)
+library(BiocParallel)
+library(DT)
+library(edgeR)
+library(ggplot2)
+library(here)
+library(limma)
+library(MASS)
+library(openxlsx)
+library(plotly)
+library(RColorBrewer)
+library(readxl)
+library(scales)
+library(tibble)
+library(tximport)
+library(CRAFT)
+library(reshape2)
+library(WGCNA)
+library(ggrepel)
+library(UpSetR)
+library(cluster)
+library(gplots)
+library(pheatmap)
+library(CoReMo)
+library(lme4)
+library(ggpubr)
+library(rlist)
+library(dplyr)
+library(BED)
+library(dendextend)
+library(fgsea)
+library(stringr)
+library(factoextra)
+library(heatmaply)
+library(TKCat)
+# 
+myPal = function(n=10){
+  #returns n colors
+  seq = rev(seq(0,255,by=255/(n)))
+  palRGB = cbind(seq,seq,255)
+  rgb(palRGB,maxColorValue=255)
+}
+bigFormat <- function(n){
+   format(n, big.mark="&nbsp;")
+}
+
+```
+
+# Correction for technical covariates
+
+Before applying any analyses, the impact of technical covariates and presence of outliers is assessed using PCA in two steps: 1. on the TSC samples only and 2. on TSC samples together with the control samples. Using PCA no covariates could be identified; however, after a first application of module identification, sequencing group was identified as a technical covariates. A batch correction for sequencing group was put in place to correct for this on the three different cohorts together. 
+
+## TSC samples 
+
+```{r , echo=F, eval = T, include=F}
+load(here("Data/04_QC/Preprocessing.rda"))
+sampleInfo <- sampleInfo %>% 
+    filter(PA_Diagnosis %in% c("TSC")) %>%
+  mutate(log10_seizure_freq = log10(Seizure_Frequency_months))
+table(sampleInfo$PA_Diagnosis, sampleInfo$Area_of_Resection)
+all_samples <- sampleInfo
+d <- vg$E[,sampleInfo$GS_RNASEQ_ID]
+dim(d)
+```
+
+The PCA shows the impact of library preparation batch. In addition, 2 control samples will be removed from downstream analyses as they are part of a separate library preparation batch not present in the HS samples.
+
+```{r, include = TRUE}
+pca <- prcomp(t(d), center=TRUE, scale.=TRUE)
+pcImp <- pca$sdev^2/sum(pca$sdev^2)
+
+## Library prep batches
+pcLib <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$Library_Prep_batch[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Library prep batches
+pcSeiz <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=sampleInfo$log10_seizure_freq[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)]
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Sequencing groups
+pcsgid <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$SGID[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Tissue
+pcArea <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$Area_of_Resection[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+
+toShow<-data.frame(cbind(pcLib,pcsgid, pcArea, pcSeiz))
+```
+
+No impact of any covariate could be assessed (table below). Even the diagnosis was not a significant covariate to differentiate the two tumor types. 
+
+```{r, include = TRUE}
+datatable(
+   toShow,
+   filter = "top",
+   options=list(pageLength=6)
+) %>%
+   formatSignif(2, digits=3) %>%
+   formatSignif(1:ncol(toShow), digits=2) %>%
+   formatStyle(
+      1:ncol(toShow),
+      backgroundColor=styleInterval(
+         c(10^(-6), 0.05), colorRampPalette(c("darkred", "white"))(3)
+      ),
+      color=styleInterval(
+         10^(-6), c("white", "black")
+      )
+   )
+```
+
+**PC1 versus PC2**
+
+```{r, include = TRUE, fig.height=5}
+toPlot <- sampleInfo %>% 
+  bind_cols(as_tibble(pca$x[sampleInfo$GS_RNASEQ_ID,1:20]))
+
+p <- ggplot(toPlot) +
+  geom_point(aes(x = PC1, y = PC4, col = Area_of_Resection), size = 2) +
+  theme_bw() 
+p
+```
+
+## TSC and control samples
+
+```{r , echo=F, eval = T, include=F}
+load(here("Data/04_QC/Preprocessing.rda"))
+sampleInfo <- sampleInfo %>% 
+    filter(PA_Diagnosis %in% c("TSC", "Control") &
+              !Area_of_Resection %in% c("Hippocampus")) %>%
+  mutate(log10_seizure_freq = log10(Seizure_Frequency_months)) %>% 
+  filter(Age_At_Time_of_Operation <= 30)
+all_samples <- sampleInfo
+table(sampleInfo$PA_Diagnosis, sampleInfo$Area_of_Resection)
+all_samples <- sampleInfo
+d <- vg$E[,sampleInfo$GS_RNASEQ_ID]
+dim(d)
+```
+
+```{r}
+ggplot(all_samples, aes(x = PA_Diagnosis, y = Age_At_Time_of_Operation)) +
+  geom_boxplot()
+```
+
+```{r}
+if(file.exists(here("Data/04_QC/TSC_expression_matrix_batch_corrected.rda"))){
+  load(here("Data/04_QC/TSC_expression_matrix_batch_corrected.rda"))
+}else{
+  combn <- factor(sampleInfo$PA_Diagnosis)
+  design <- model.matrix(~0+combn)
+  colnames(design) <- levels(combn)
+  head(design)
+  bc_vg <- removeBatchEffect(d,
+                             batch = sampleInfo$SGID,
+                             design = design)
+  save("bc_vg", file = here("Data/04_QC/TSC_expression_matrix_batch_corrected.rda"))
+}
+```
+
+```{r, include = TRUE}
+d <- bc_vg
+pca <- prcomp(t(d), center=TRUE, scale.=TRUE)
+pcImp <- pca$sdev^2/sum(pca$sdev^2)
+
+## Library prep batches
+pcLib <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$Library_Prep_batch[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Library prep batches
+pcSeiz <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=sampleInfo$log10_seizure_freq[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)]
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Sequencing groups
+pcsgid <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$SGID[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Tissue
+pcArea <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$Area_of_Resection[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+## Condition
+pcDiag <- p.adjust(apply(
+   pca$x, 2,
+   function(pc){
+     head(pc)
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(sampleInfo$PA_Diagnosis[match(rownames(pca$x),sampleInfo$GS_RNASEQ_ID)])
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+
+toShow<-data.frame(cbind(pcLib,pcsgid, pcDiag,pcArea, pcSeiz))
+```
+
+Only diagnosis is now a significant variable distuighing control samples from tumor samples although this differentiation is not strong as can be seen on the plots below.
+
+```{r, include = TRUE}
+datatable(
+   toShow,
+   filter = "top",
+   options=list(pageLength=6)
+) %>%
+   formatSignif(2, digits=3) %>%
+   formatSignif(1:ncol(toShow), digits=2) %>%
+   formatStyle(
+      1:ncol(toShow),
+      backgroundColor=styleInterval(
+         c(10^(-6), 0.05), colorRampPalette(c("darkred", "white"))(3)
+      ),
+      color=styleInterval(
+         10^(-6), c("white", "black")
+      )
+   )
+```
+
+**PC1 versus PC2**
+
+The plot below shows the first two principal components with diagnosis and area of resection. 
+
+```{r, include = TRUE, fig.height=5}
+toPlot <- sampleInfo %>% 
+  bind_cols(as_tibble(pca$x[sampleInfo$GS_RNASEQ_ID,1:20]))
+
+p <- ggplot(toPlot) +
+  geom_point(aes(x = PC1, y = PC2, col = PA_Diagnosis), size = 2) +
+  theme_bw() 
+p
+```
+
+# Gene mutations
+
+No outliers or technical covariates could be identified. The table below shows the structure of the dataset consisting of `r sampleInfo %>% filter(PA_Diagnosis  == "TSC") %>% nrow` TSC samples and `r sampleInfo %>% filter(PA_Diagnosis  == "Control") %>% nrow` control samples. 
+
+```{r, include = TRUE}
+kable(table(sampleInfo$PA_Diagnosis, sampleInfo$Gene))
+```
+
+# Module identification 
+
+This reports deals with the identification of modules of gene coregulation in tuberous sclerosis complex (TSC) and assessment of the conservation of the identified regulations in other contexts. The coregulation modules are build across the different tissue that show similarity in gene expression and have sufficient amount of samples to avoid interference of tissue-specific regulations. For TSC there are 20 samples that will be used to identified gene modules of coregulation. Library preparation batch was identified to impact gene expression for TSC samples. Therefore, a batch correction was performed using limma R package to avoid that library preparation batch might drive the module identification.
+
+A detailed explanation of the identification of gene co-expression modules can be found in [Srivastava et al. 2018](https://www.nature.com/articles/s41467-018-06008-4) or the Epinet project. Briefly, the different steps consist of: 
+<ol>
+<li> Differential expression analysis on gene level between tumor cohorts and healthy patients </li>
+<li> Gene filtering based on variance in expression </li>
+<li> Scale-free fit index </li>
+<li> Unsupervised hierarchical clustering and defining the optimal number of clusters </li>
+<li> Module robustness assessment </li>
+<li> Module overview and association to phenotype </li>
+<li> Functionally annotation of the modules </li>
+<li> Identification of "healthy" regulations by comparison with coregulation modules constructed in healthy tissue </li>
+<li> Assessment of conservation in other pathologies and contexts to understand the functions of the module in the broader context of epilepsy and identify potential specific regulations </li>
+<li> Differential co-expression of modules compared to control samples </li>
+<li> Causal reasoning for prediction of upstream regulators </li>
+</ol>
+
+## Differential expression analysis on gene level between tumor cohorts and healthy patients
+
+Due to the unbalance between tumor samples (`r sampleInfo %>% filter(PA_Diagnosis != "Control") %>% nrow()` samples) and control samples (`r sampleInfo %>% filter(PA_Diagnosis == "Control") %>% nrow()` samples), there may be more genes significantly differentially expressed between the two groups ([Yang et al. 2006](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1780111/)).
+
+
+```{r deg, cache=FALSE,echo=FALSE}
+resFile <- here("Data/06_Modules/TSC/Module-Data","DEG.rda")
+
+if(file.exists(resFile)){
+ load(resFile)
+}else{
+  ## design, timepoint as fixed effect
+  dd <- bc_vg[,pull(sampleInfo, GS_RNASEQ_ID)]
+  s <- all_samples %>% 
+    as_tibble() 
+  combn <- factor(gsub(" ", "" , s$PA_Diagnosis))
+  ##
+  design <- model.matrix( ~ 0 + combn)
+  colnames(design) <- c(levels(combn))
+  dim(design)
+  
+  ## lm
+  fit <- lmFit(object = dd,
+               design = design)
+  ##
+  contrast.matrix <- makeContrasts(TSC-Control, levels = design)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  fit2 <- eBayes(fit2)
+  deg <- topTable(fit = fit2, coef = 1, number = Inf)
+  rm(combn, design, fit, contrast.matrix, fit2)
+  save(deg, file=resFile)
+}
+```
+
+Top 1000 genes
+
+```{r, include = TRUE}
+gd <- getBeIdDescription(rownames(deg),
+                         be = "Gene",
+                         source = "Ens_gene",
+                         organism = "human")
+toShow <- deg %>%
+  mutate(Gene = gd$symbol[match(rownames(deg), gd$id)])
+datatable(toShow %>% 
+            select(Gene, AveExpr, logFC, FDR = adj.P.Val) %>% 
+            arrange(FDR) %>% 
+            slice(1:1000),
+          rownames = FALSE, 
+          filter = "top",
+          extensions = 'Buttons',
+          options = list(
+              dom = "Blfrtip",
+              buttons = c('csv'),
+              order = list(list(3, "asc")),
+              autoWidth = TRUE)) %>%
+  formatSignif(c("AveExpr","logFC", "FDR"), 2)
+```
+
+## Gene filtering depending on variance 
+
+```{r mad,echo=FALSE}
+sampleInfo <- sampleInfo %>% filter(PA_Diagnosis %in% c("TSC"))
+d <- bc_vg[,sampleInfo$GS_RNASEQ_ID]
+sdThr <- 0.25
+MAD <- apply(d,1,function(x) mad(x))
+```
+
+For the identification of co-expression modules only genes showing high variance across the samples are kept for clustering analysis. Standard deviation has been
+estimated using the median absolute deviation (MAD) in order to avoid outlier
+triggered bias. Before MAD filtering there were `r bigFormat(nrow(d))` genes in the dataset. 
+
+The figure below shows the distribution of gene expression MAD
+across all samples.
+
+```{r mad_plot, include=TRUE,echo=FALSE, fig.height=5}
+hist(
+  MAD, breaks=100,
+  col="grey",
+  xlab="MAD",
+  main="MAD of gene expression"
+)
+abline(v=sdThr, col="red", lty=2, lwd=2)
+```
+
+```{r}
+KeptProbes <- names(MAD)[which(MAD >= sdThr)]
+length(KeptProbes)
+d <- bc_vg[KeptProbes, sampleInfo$GS_RNASEQ_ID]
+
+save(KeptProbes, 
+     file = here("Data","06_Modules/TSC/Module-Data", "List-KeptProbes.rda"))
+```
+
+It has been arbitrarily decided to keep only the
+`r bigFormat(length(KeptProbes))` genes showing a MAD greater or equal
+to `r sdThr`.
+
+
+```{r cormat, cache=FALSE,echo=FALSE,include=FALSE}
+## Create Spearman correlation matrix for all genes dislaying variance (MAD > 0.25) 
+corMeth <- "spearman"
+sampGroup <- "TSC"
+sampleInfo <- sampleInfo %>% filter(PA_Diagnosis %in% c("TSC"))
+dim(d)
+corFile <- here("Data","06_Modules/TSC/Module-Data",
+                paste0(corMeth,"-KeptProbes-",sampGroup,".rda"))
+##
+if(!file.exists(here("Data","06_Modules","TSC/Module-Data/Modules-TSC"))){
+  if(!file.exists(corFile)){
+    message(paste("Applying ", corMeth, " on ", sampGroup, "..."))
+    message(Sys.time())
+    message(corMeth, " correlation in ", sampGroup)
+    corMat <- cor(t(d), method=corMeth)
+    save(corMat,file=corFile)
+    gc()
+    message("... Done")
+    message(Sys.time())
+  }else{
+    load(corFile)
+  }
+}
+```
+
+## Scale-free fit index
+
+<blockquote>
+Constructing a weighted gene network entails the choice of the
+soft thresholding power β to which co-expression
+similarity is raised to calculate adjacency
+([Zhang and Horvath 2005](https://www.ncbi.nlm.nih.gov/pubmed/16646834)).
+[Zhang and Horvath (2005)](https://www.ncbi.nlm.nih.gov/pubmed/16646834)
+have proposed to choose the soft thresholding
+power based on the criterion of approximate scale-free topology.
+<footer><cite>
+[Tutorial for the WGCNA package for R](https://labs.genetics.ucla.edu/horvath/htdocs/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/Consensus-NetworkConstruction-man.pdf)
+</cite></footer>
+</blockquote>
+
+The figure below shows the the scale-free fit index and the mean connectivity as a function of the soft-thresholding power.
+
+```{r scalefree,include=FALSE,echo=FALSE}
+## Scale-free fit index
+defaultSoftPower <- 6
+## Choose a set of soft-thresholding powers
+powers <- 1:20
+## Call the network topology analysis function
+r2cut <- 0.85
+sFile <- here("Data", "06_Modules", "TSC/Module-Data/ScaleFreeIndex_TSC.rda")
+if(file.exists(sFile)){
+  load(sFile)
+}else{
+  sft <- WGCNA::pickSoftThreshold(t(d),
+                           powerVector = powers,
+                           RsquaredCut = r2cut,
+                           verbose = 0,
+                           corOptions = list(method=corMeth)
+                           )
+  save(sft, file = sFile)
+}
+```
+
+```{r scalefree_plot,include=TRUE,echo=FALSE, fig.height=6}
+opar <- par(no.readonly=T)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+## Scale-free topology fit index as a function of the soft-thresholding power
+plot(
+  sft$fitIndices[,1],
+  -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+  xlab="Soft Threshold (power)",
+  ylab="Scale Free Topology Model Fit, signed R²",
+  type="n",
+  main = "Scale independence"
+)
+text(
+  sft$fitIndices[,1],
+  -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+  labels=powers, cex=cex1, col="red"
+)
+abline(h=r2cut,col="red", lty=2)
+abline(
+  h=-sign(sft$fitIndices[,3])*sft$fitIndices[,2][which(sft$fitIndices[,1]==defaultSoftPower)],
+  col="blue", lty=2
+)
+## Mean connectivity as a function of the soft-thresholding power
+plot(
+  sft$fitIndices[,1],
+  sft$fitIndices[,5],
+  xlab="Soft Threshold (power)",
+  ylab="Mean Connectivity", type="n",
+  main = paste("Mean connectivity")
+)
+text(
+  sft$fitIndices[,1],
+  sft$fitIndices[,5],
+  labels=powers,
+  cex=cex1,
+  col="red"
+)
+par(opar)
+```
+
+## Unsupervised hierarchical clustering and defining the optimal number of clusters
+
+```{r clust,include=FALSE,echo=FALSE}
+clMeth <- "ward.D"
+softPower <- defaultSoftPower
+minClusSize <- 1
+##
+subcorDir <- here("Data", "06_Modules", "ClustModules")
+dir.create(subcorDir,showWarnings = FALSE)
+corFile <- here("Data", "06_Modules", "TSC", "ClustModules",
+                "Clustering_TSC.rda")
+##
+if(file.exists(corFile)){
+  load(corFile)
+}else{
+  distMat <- 1-abs(corMat)^softPower
+  distMat <- as.dist(distMat)
+  tree  <- stats::hclust(d=distMat, method=clMeth)
+  rm(distMat)
+  gc()
+}
+```
+
+Clustering using the `r clMeth` clustering method is performed on the correlation matrix.  
+
+```{r treecut,echo=FALSE}
+if(!file.exists(corFile)){
+  cutOpt <- treeCutQual(
+    tree, 
+    corMat,
+    k.min = 1, 
+    k.max = 200 ,
+    minsize = minClusSize ,
+    d = d, 
+    corMeth = corMeth #, mc.cores=3
+  )
+  kinfl <- CoReMo::getInflPoint(cutOpt[,c("k", "R2 weighted median")])
+  rm(cutOpt)
+  gc()
+}
+```
+
+The optimal number of clusters was identified using a static cut comparing different levels of K clusters. The chosen number of clusters is selected when the increase of weighted average
+of R<sup>2</sup> reaches a plateau ($d(dy/dx)/dx \approx 0$). No minimum cluster size for the downstream analyses has been set. 
+
+```{r treecut_plot, include=TRUE,echo=FALSE, fig.height=5}
+CoReMo::plotInfl(kinfl)
+ksel <- attr(kinfl, "xlim")
+```
+
+```{r clustqual, echo=FALSE}
+if(!file.exists(corFile)){
+  clusters <- CoReMo::msCutree(tree, 
+                               k = ksel, 
+                               minsize = minClusSize, 
+                               d = d, 
+                               corMeth = corMeth)
+  qc <- CoReMo::clQual(clusters, 
+                       corMat = corMat)
+  junkModule <- rownames(qc)[which(qc[,"r2med"] < 0.05)]
+  inJunk <- names(clusters)[which(clusters == junkModule)]
+  notInJunk <- setdiff(names(clusters), inJunk)
+  save(
+    tree, kinfl, clusters, qc, junkModule, inJunk, notInJunk,
+    file = corFile
+  )
+}
+```
+
+Genes have finally been divided into `r nrow(qc)` modules (including one junk module).
+
+## Module robustness
+
+The leave-one-out bootstrapping procedure is used to assess the impact of samples on the stability and robustness of gene coregulation modules. For each permutation, the correlation matrix is calculated and the modules are constructed and their membership recorded. To apply this procedure, the number of clusters has already been defined beforehand using the full dataset and standard CoReMo procedure. This procedure only aims to identify more robust module memberships by LOO bootstrapping. Finally, a similarity matrix is build based on cluster membership across the different permutations to identify junk modules based on an arbitrary threshold. After identification of junk module members, these are removed from the analyses and the remaining genes are clustered by using the similarity matrix as input. These are the robust modules derived from LOO bootstrapping procedure. 
+
+```{r module_settings}
+wgcna.clMeth      <- "ward.D"
+wgcna.corMeth    <- "spearman"
+wgcna.softPower   <- 6
+wgcna.minClusSize <- 1
+wgcna.k        <- 16
+```
+
+```{r, eval = FALSE}
+# source(here("Analysis/E01-Module-Robustness-Bootstrapping.R"))
+```
+
+```{r ls_permutate_modules}
+load(here("Data/06_Modules/TSC/Module-Data/LOO_TSC_Cluster.rda"))
+load(here("Data/06_Modules/TSC/Module-Data/Bootstrapping_Similarity_TSC.rda"))
+```
+
+After application of the leave-one-one procedure, `r length(unique(junk.genes))` genes are categorized as junk genes in at least one bootstrap. `r table(junk.genes) %>% {.[. == 65]} %>% length` genes are always assigned to the junk genes. If gene is assigned to the junk module more than 50% of the permutations, this gene will be considered as junk, leaving `r length(junk.genes.out)` genes within the junk module that are and are removed from the analysis. Finally, the modules are constructed by clustering the remaining gene using the similarity matrix constructed during bootstrapping. This matrix captures the number of times gene are co-clustered during the leave-one-out procedure resulting in more robust modules. This leaves `r nrow(LOO.clusters) - length(junk.genes.out)` assigned to `r wgcna.k` coexpression modules. 
+
+```{r, include = TRUE, fig.height=4}
+junk.genes.thres <- (length(unique(mod.decision$Bootstrap)) - 1)/2
+toShow <- as.vector(table(junk.genes))
+hist(toShow[toShow < max(toShow)], main = "Distribution of junk membership")
+abline(v = junk.genes.thres)
+text(x=junk.genes.thres+6, y=1000, "50% threshold")
+```
+
+
+```{r ls_consensuscluster}
+# Consensus Cluster
+dist.matrix <- as.dist(1 - (similarity.mat/(ncol(LOO.clusters)-1)))
+# # Simple Ordering
+clus.memb   <- dist.matrix %>%
+  stats::hclust(., method = "ward.D") %>%
+  cutree(., k=(wgcna.k-1)) %>% sort
+hm.order    <- names(clus.memb)
+sim.mat.out <- similarity.mat %>%
+               .[match(hm.order, rownames(.)),] %>%
+               .[,match(hm.order, colnames(.))]
+
+## Compare to original clusters
+BS_clusters <- LOO.clusters %>%
+  dplyr::select(ensgene, BS_0) %>%
+  left_join(stack(clus.memb) %>%
+              mutate_if(is.factor, as.character) %>%
+              rename(BSF = values,
+                     ensgene = ind),
+            by = "ensgene")
+```
+
+```{r}
+# Internal Module Correlation vs Average Similarity
+if(file.exists(here("Data/06_Modules/TSC/Module-Data/TSC_CorrMembership.rda"))){
+  load(here("Data/06_Modules/TSC/Module-Data/TSC_CorrMembership.rda"))
+}else{
+  data.modcor <- data.frame()
+  for(j in 1:max(clus.memb)) {
+    subset.genes  <- clus.memb %>% .[. == j] %>% names
+    cormat.subset <- corMat %>%
+                     .[subset.genes, subset.genes] %>%
+                     .[upper.tri(.)] %>% abs %>%
+                     {. ^ 2} %>% mean
+  
+    cormat.sim    <- similarity.mat %>%
+                     .[subset.genes,subset.genes] %>%
+                     .[upper.tri(.)] %>% median
+    module.size   <- length(subset.genes)
+    data.modcor   <- rbind(data.modcor, c(j, cormat.subset, module.size, cormat.sim))
+  }
+  data.modcor <- data.modcor %>%
+                 as.data.frame %>%
+                 `colnames<-`(c("Module", "Median R2", 
+                                "Module Size", 
+                                "Median Similarity"))
+  data.clusters <- clus.memb
+  data.cormat   <- corMat[names(data.clusters),names(data.clusters)]
+  save(data.clusters, data.cormat, data.modcor, 
+       file = here("Data/06_Modules/TSC/Module-Data/TSC_CorrMembership.rda"))
+}
+```
+
+```{r, include = FALSE}
+datatable(data.modcor,
+          rownames = FALSE) %>%
+  formatSignif(2, digits = 2)
+```
+
+The plot below shows the module's median R² and its median similarity within each module, namely the median of the number of times genes within the modules are co-clustered during the leave-one-out bootstrapping procedure. The size represents the number of genes within the module.
+
+```{r, include = TRUE, fig.height=5}
+modcor.gg   <- data.modcor %>%
+               ggplot(., aes(`Module Size`, `Median R2`, label = `Module`)) +
+               geom_vline(xintercept = 0,   linetype = "dashed", alpha = 0.5) +
+               geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+               geom_point(aes(size = `Median Similarity`)) +
+               geom_label_repel() +
+               theme_bw() +
+               labs(title = "Module Size Against Module Internal Median R2")
+
+ggplotly(modcor.gg)
+```
+
+```{r size_plot,include = FALSE}
+plot(
+ data.modcor$`Module Size`, data.modcor$`Median R2`,
+  # log = "x",
+  xlab = "size", ylab = "R²",
+  main = paste("Module quality in", sampGroup),
+  type = "n"
+)
+text(
+  data.modcor$`Module Size`, data.modcor$`Median R2`,
+  rownames(data.modcor),
+  cex=0.5
+)
+```
+
+Data of the modules is available in the **Data/06_Modules/TSC** folder.
+
+```{r size_tb,include=FALSE,echo=FALSE, eval = FALSE}
+toShow <- as.data.frame(table(data.clusters))
+datatable(
+ toShow,
+ rownames=FALSE,
+ colnames=c("Module","Number of genes"),
+ elementId=paste0("ModuleNamesShow-", round((10^6)*runif(1)))
+)
+```
+
+## Module overview and association to phenotype
+
+After construction of the modules, potential sub-modules are identified when positively correlated and anti-correlated genes are present in the module. The sub-modules are identified by the suffix "o" and "u" based on mean logFC between HS and the control samples.
+
+```{r mod_anno, cache=FALSE,eval = TRUE, echo=FALSE}
+corFile <-  here("Data","06_Modules","TSC/Module-Data/Modules-TSC.rda")
+if(file.exists(corFile)){
+  load(corFile)
+}else{
+  modules <- list()
+  modules.Ensembl <- list()
+  modules.entrez <- list()
+  
+  for(mid in unique(data.clusters)){
+    m <- names(data.clusters[which(data.clusters == mid)])
+    mid <- paste(sampGroup, mid, sep = ".")
+    resFile2 <- here("Data/06_Modules/TSC/ClustModules", paste0(mid, ".rda"))
+    if(file.exists(resFile2)){
+      load(resFile2)
+    }else{
+      mCorMat <- data.cormat[m, m]
+      attr(mCorMat, "geneMed") <- apply(mCorMat^2, 2, median) # squared values
+      save(mCorMat, file=resFile2)
+    }
+        lfc <- deg[m, "logFC"]
+    names(lfc) <- m
+    modules.Ensembl[[mid]] <- getSubModules(mCorMat, lfc)
+    modules[[mid]] <- mCorMat
+  }
+  ## Convert to Entrez gene IDs
+  modules.entrez <- lapply(
+    modules.Ensembl,
+    convBeIdLists,
+    from = "Gene", from.source = "Ens_gene", from.org = "human",
+    to = "Gene", to.source = "EntrezGene", to.org = "human",
+    restricted=TRUE
+  )
+  moduleList <- BED::BEIDList(rlist::list.flatten(modules.Ensembl))
+  save(modules, modules.Ensembl, modules.entrez, moduleList, file = corFile)
+}
+rm(corMat, mgtex, mCorMat, dn, degf, dn, gtex, clust.memb, 
+   cormat.sim, cormat.subset)
+gc()
+```
+
+The association of the module with any of the recorded phenotypes is tested using linear regression for each module's eigenGene and the different phenotypes. As duration and age are not independent of each other, the association for duration is corrected for age.  
+
+The table below shows the overview of the modules, the number of genes, average R², and FDR of the association with different phenotypes. 
+
+```{r batchAss}
+## Eigen genes
+mvec <- stack(lapply(modules.Ensembl, unlist))
+mvecVal <- as.character(mvec$ind)
+names(mvecVal) <- mvec$values
+mvec <- mvecVal
+rm(mvecVal)
+length(mvec)
+##
+eigenGenes <- getEigenValues(mvec, d)
+egg <- t(eigenGenes)
+tb <- sampleInfo[match(rownames(egg), sampleInfo$GS_RNASEQ_ID),] %>%
+  as_tibble()
+egg <- cbind(tb, egg) %>%
+ mutate(
+   Gender = as.factor(Gender)
+ )
+## Checking pup/batch/gender effects on module construction
+modulesTable <- list()
+size <- sapply(modules.Ensembl, function(x){length(unlist(x))} )
+r2 <- sapply(modules, function(x){median(as.dist(x^2))})
+o.size <- sapply(modules.Ensembl, function(x){length(x$o)})
+u.size <- sapply(modules.Ensembl, function(x){length(x$u)})
+##
+seizfreqAss <- p.adjust(apply(
+   egg[,grep("TSC[.]",colnames(egg))], 2,
+   function(pc){
+      toTest <- data.frame(
+         val=pc,
+         groups=egg$log10_seizure_freq
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+##
+genderAss <- p.adjust(apply(
+     egg[,grep("TSC[.]",colnames(egg))], 2,
+   function(pc){
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(egg$Gender)
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+##
+ageAss <- p.adjust(apply(
+     egg[,grep("TSC[.]",colnames(egg))], 2,
+   function(pc){
+      toTest <- data.frame(
+         val=pc,
+         groups=egg$Age_At_Time_of_Operation
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+##
+durAss <- p.adjust(apply(
+     egg[,grep("TSC[.]",colnames(egg))], 2,
+   function(pc){
+      toTest <- data.frame(
+         val=pc,
+         groups=egg[, c("Duration_years", "Age_At_Time_of_Operation")]
+      )
+       drop1(lm(data=toTest,
+                 formula=val~groups.Duration_years+groups.Age_At_Time_of_Operation),
+             test="F")[2,"Pr(>F)"]
+   }
+), method="BH")
+##
+SGIDAss <- p.adjust(apply(
+    egg[,grep("TSC[.]",colnames(egg))], 2,
+   function(pc){
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(egg$SGID)
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+##
+libAss <- p.adjust(apply(
+    egg[,grep("TSC[.]",colnames(egg))], 2,
+   function(pc){
+      toTest <- data.frame(
+         val=pc,
+         groups=as.factor(egg$Library_Prep_batch)
+      )
+      summary(aov(formula=val~groups, data=toTest))[[1]]$`Pr(>F)`[1]
+   }
+), method="BH")
+modulesTable <- tibble(Module = names(modules.Ensembl), 
+                       `Module size` = size,
+                       R2 = r2,
+                       `O Size` = o.size,
+                       `U Size` = u.size,
+                       # `Tumor type` = diagAss[names(modules.Ensembl)],
+                       `Seizure frequency` = seizfreqAss[names(modules.Ensembl)],
+                       Age = ageAss[names(modules.Ensembl)],
+                       Gender = genderAss[names(modules.Ensembl)],
+                       `Duration (years)` = durAss[names(modules.Ensembl)],
+                       `Sequencing group` = SGIDAss[names(modules.Ensembl)],
+                       `Library batch` = libAss[names(modules.Ensembl)])
+save(modulesTable, 
+     file = here("Data", "06_Modules/TSC/Module-Data/PhenotypeAssociation.rda"))
+```
+
+```{r, include = TRUE}
+shown <- datatable(modulesTable) %>%
+  formatSignif(c(3,6:11), digits = 2) %>%
+  formatStyle(
+     c(6:11),
+     backgroundColor = styleInterval(c(0.05), c('#afe575', 'transparent'))) %>%
+  formatStyle(
+     "O Size",
+     background = styleColorBar(modulesTable$"O Size", "#F08080"),
+     backgroundSize = '100% 90%',
+     backgroundRepeat = 'no-repeat',
+     backgroundPosition = 'center') %>% 
+  formatStyle(
+     "U Size",
+     background = styleColorBar(modulesTable$"U Size", "#F08080"),
+     backgroundSize = '100% 90%',
+     backgroundRepeat = 'no-repeat',
+     backgroundPosition = 'center')
+absMax <- max(abs(range(modulesTable$R2, na.rm=TRUE)))
+breaks <- seq(-absMax, absMax, length.out=20)
+cols <- colorRampPalette(c("blue", "white", "red"))(21)
+shown <- formatStyle(
+  shown, "R2",
+  backgroundColor = styleInterval(breaks, cols)
+)
+shown
+```
+# Functional annotation {.tabset}
+
+In this section, each module is functionally annotated by calculating the overlap of the genes inside with different biological databases. To establish whether the overlap between a module’s genes and genes in a biological pathway is significant a hypergeometric test is used.
+
+```{r}
+toTest <- rlist::list.flatten(modules.Ensembl)
+eg <- rownames(d)
+bescope = list(be = "Gene", source = "Ens_gene", organism = "human")
+```
+
+## MetaBase pathway maps
+
+```{r}
+# faFile <- here("Data", "06_Modules", "TSC/Module-Data/FunctionalAnnotation-TSC.rda")
+if(!file.exists(faFile)){
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="MetaBase_pathway",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- TBTools::qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resMB <- res %>% 
+    mutate(type = "MetaBase_pathway") %>%
+    inner_join(metadata(fl) %>% select("externalID", name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="https://portal.genego.com/cgi/imagemap.cgi?id=%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+}
+
+```
+
+```{r, include = TRUE}
+datatable(resMB %>%
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+## Reactome pathways
+
+```{r}
+if(!file.exists(faFile)){
+ nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="Reactome_pathways_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resRA <- res %>% 
+    mutate(type = "Reactome_pathways_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://www.reactome.org/PathwayBrowser/#/%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+}
+```
+
+
+```{r, include = TRUE}
+datatable(resRA %>%
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank)%>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+## Gene Ontology: biological process
+
+```{r}
+if(!file.exists(faFile)){
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="GO_biological_process_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resGOBP <- res %>% 
+    mutate(type = "GO_biological_process_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://amigo.geneontology.org/amigo/term/GO:%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+}
+```
+
+
+```{r, include = TRUE}
+datatable(resGOBP %>%             
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+## Gene Ontology: molecular function
+
+```{r}
+if(!file.exists(faFile)){
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="GO_molecular_function_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resGOMF <- res %>% 
+    mutate(type = "GO_molecular_function_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://amigo.geneontology.org/amigo/term/GO:%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+}
+```
+
+
+```{r, include = TRUE}
+datatable(resGOMF %>%          
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+
+## Gene Ontology: cellular component
+
+```{r}
+if(!file.exists(faFile)){
+  nbeidsLim <- c(10, 500)
+  fl <- do.call(focusOnScope, c(
+     list(
+        x=getBekBeids(
+           externalKnowledge="GO_cellular_component_human",
+           nbeids=nbeidsLim
+        ),
+        force=TRUE
+     ),
+     bescope
+  ))
+  tmp <- unlist(lapply(fl, length))
+  fl <- fl[which(tmp>=min(nbeidsLim) & tmp <= max(nbeidsLim))]
+  names(fl) <- metadata(fl)$externalID
+  res <- qrlEnrich(
+     query=toTest, reference=fl,
+     omega=eg,
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resGOCC <- res %>% 
+    mutate(type = "GO_cellular_component_human") %>%
+    inner_join(metadata(fl) %>% select(externalID, name), 
+               by = c("ruuid" = "externalID")) %>%
+    mutate(Pathway = paste0(sprintf('<a href="http://amigo.geneontology.org/amigo/term/GO:%s" target="_blank">%s</a>',
+                                    ruuid,
+                                    name)))
+}
+```
+
+
+```{r, include = TRUE}
+datatable(resGOCC %>%              
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = Pathway,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          escape = FALSE,
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+## PangloaDB cell type biomarkers
+
+```{r}
+if(!file.exists(faFile)){
+  library(TKCat)
+  tkcon <- chTKCat(password = "")
+  pangloadb <- get_MDB(tkcon,"PanglaoDB")
+  fl <- inner_join(pangloadb$PanglaoDB_Markers,
+                   pangloadb$PanglaoDB_Genes %>% select(symbol, ensembl),
+                   by = c("symbol")) %>% 
+    inner_join(pangloadb$PanglaoDB_CellTypes %>% select(`cell type`, organ),
+               by = c("cell type")) %>% 
+    filter(grepl("ENSG", ensembl))
+  sfl <- split(fl$ensembl, fl$`cell type`)
+  
+  res <- qrlEnrich(
+     query=toTest, reference=sfl,
+     omega=unlist(eg),
+     mc.cores=30
+  )
+  colnames(res) <- c(
+     "uuid", "query", "ruuid", "reference",
+     "intersection", "p-value", "FDR"
+  )
+  res <- do.call(rbind, by(
+     res,
+     res$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  rownames(res) <- NULL
+  resPAN <- res %>% 
+    mutate(type = "PangloaDB cell type biomarkers") %>% 
+    mutate(Organ = fl$organ[match(ruuid, fl$`cell type`)])
+  save(resMB, resRA, resGOBP, resGOMF, resGOCC, resMSig, resHB, resPAN, resCTEN, resMGD,
+     file = faFile)
+}
+```
+
+```{r, include = TRUE}
+datatable(resPAN %>%        
+            filter(FDR <= 0.05) %>%
+            select(Module = uuid,
+                   `Module size` = query,
+                   Concept = ruuid,
+                   Organ,
+                   `Concept size` = reference,
+                   Intersect = intersection,
+                   FDR,
+                   `Relative rank` = relRank) %>%
+            mutate(Module = as.factor(Module)),
+                   # Concept = as.factor(Concept)),
+          filter = "top",
+          options = list(
+              order = list(5, "asc"),
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(3, "asc")),
+              autoWidth = TRUE,
+              columnDefs = list(list(width = '100px', targets = c(0, 2)))),
+          rownames = FALSE) %>%
+  formatSignif(6:7, digits = 2)
+```
+
+# Assessment of conservation
+
+In this section, the conservation of the properties of the identified modules is assess in other normal and disease conditions. The conservation of a module's median correlation (R²) in another conditions is assessed using 1000 permutations over module membership. In addition, a module's median R² assess the level of coregulation. While modules can be found to be conserved with a very low R² due to technical artifacts, a minimum threshold is put in place using the lowest median R² in the original modules.
+
+
+```{r, eval = FALSE}
+# source(here("Analysis/S00-Conservation-Modules.R"))
+```
+
+
+```{r, include = TRUE, eval = TRUE}
+if(file.exists( here("Data/06_Modules/TSC/Conservation/TSC_ConservationResults.rda"))){
+  load(here("Data/06_Modules/TSC/Conservation/TSC_ConservationResults.rda"))
+}else{
+  ## Reference = HS modules ----
+  load(here("Data/06_Modules/TSC/Conservation/TSC_Conservation.rda"))
+  conservation <- do.call(rbind,
+                          lapply(names(toRet),
+                                 function(x){
+                                   toRet <- toRet[[x]]$conservation %>%
+                                     # filter(FDR <= 0.05) %>%
+                                     mutate(Project = sub("_.*", "", x),
+                                            Condition = sub(paste0(unique(Project),"_"), "",
+                                                            x)) %>%
+                                     select(Project,
+                                            Condition,
+                                            Module = l, 
+                                            R2 = value,
+                                            p.value,
+                                            FDR) %>%
+                                     distinct()
+                                   if(!all(names(moduleList) %in% toRet$Module)){
+                                     toAdd <- tibble(Project = gsub("_.*", "", x),
+                                                     Condition = gsub(".*_", "", x),
+                                                     Module = names(moduleList),
+                                                     R2 = NA,
+                                                     p.value = NA, 
+                                                     FDR = NA) %>%
+                                       filter(!Module %in% toRet$Module)
+                                     toRet <- bind_rows(toRet,
+                                                        toAdd)
+                                   }
+                                   return(toRet)
+                                 }))
+  crosstabulation <- do.call(rbind,
+                          lapply(names(toRet),
+                                 function(x){
+                                   toRet <- toRet[[x]]$crossTab %>%
+                                     # filter(FDR <= 0.05) %>%
+                                     mutate(Project = sub("_.*", "", x),
+                                            Condition = sub(paste0(unique(Project),"_"), "",
+                                                            x)) %>%
+                                     select(Project,
+                                            Condition,
+                                            Module = q,
+                                            `Module size` = qsize,
+                                            `External module` = r,
+                                            `External size` = rsize,
+                                            intersect = i,
+                                            "P-Value",
+                                            FDR) 
+                                   return(toRet)
+                                 })) 
+  
+  ## AMC controls
+  load(here("Data/06_Modules/TSC/Conservation/TSC_AMC_Control_Conservation.rda"))
+  toAdd <- do.call(rbind,
+                          lapply(names(toRet),
+                                 function(x){
+                                    toRet <- toRet[[x]]$conservation %>%
+                                     # filter(FDR <= 0.05) %>%
+                                     mutate(Project = gsub("_.*", "", x),
+                                            Condition = gsub("AMC_", "", x)) %>% 
+                                     select(Project,
+                                            Condition,
+                                            Module = l, 
+                                            R2 = value,
+                                            p.value,
+                                            FDR) %>%
+                                     distinct()
+                                   if(!all(names(moduleList) %in% toRet$Module)){
+                                     toAdd <- tibble(Project = gsub("_.*", "", x),
+                                                     Condition = gsub(".*_", "", x),
+                                                     Module = names(moduleList),
+                                                     R2 = NA,
+                                                     p.value = NA, 
+                                                     FDR = NA) %>%
+                                       filter(!Module %in% toRet$Module)
+                                     toRet <- bind_rows(toRet,
+                                                        toAdd)
+                                   }
+                                   return(toRet)
+                                 }))
+  conservation <- bind_rows(conservation, toAdd)
+  
+  save(conservation, crosstabulation, 
+       file = here("Data/06_Modules/TSC/Conservation/TSC_ConservationResults.rda"))
+}
+ 
+```
+
+
+## Overview conservation
+
+```{r, include = TRUE, eval = TRUE, plotly = TRUE}
+toShow <- conservation %>%
+  mutate(Analysis = paste(Project, Condition, sep = "_")) %>%
+  select(Analysis, Module, FDR) 
+toShow <- reshape2::dcast(toShow, Analysis~Module)
+rownames(toShow) <- toShow[,1]
+toShow <- toShow[,-1]
+toShow <-  data.matrix(toShow)
+toShow[is.na(toShow)] <- 1
+toShow[toShow > 0.05] <- 1
+toPlot <- -log10(toShow)
+
+heatmaply::heatmaply(data.matrix(toPlot), 
+                     show_dend=c(FALSE, TRUE), 
+                     fontsize_row = 6, 
+                     fontsize_column = 6)
+```
+
+## Corresponding modules in other cohorts
+
+Using a hypergeometric test, the overlap of gene content between different modules across studies can be assessed. The table below shows the modules significantly overlapping the HS modules. 
+
+```{r, include = TRUE, eval = TRUE}
+datatable(crosstabulation  %>%
+           mutate(Project = as.factor(Project),
+                  Condition = as.factor(Condition),
+                  Module = as.factor(Module))  %>%
+           filter(FDR <= 0.05),
+          rownames = FALSE,
+          filter = "top",
+          options = list(
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(4, "asc"))),
+          class = "display",
+          escape = FALSE) %>%
+    formatSignif(c("FDR"), digits = 2)
+```
+
+## Conservation in AMC
+
+
+```{r}
+toShow <- conservation %>%
+  filter(Project == "AMC")  %>%
+  filter(Condition != "GNT_disease") %>% 
+  filter(Condition != "TSC_disease") %>% 
+  mutate(Analysis = paste(Project, Condition, sep = "_")) %>%
+  select(Analysis, Module, FDR) 
+toShow <- reshape2::dcast(toShow, Analysis~Module)
+rownames(toShow) <- toShow[,1]
+toShow <- toShow[,-1]
+toShow <-  data.matrix(toShow)
+toShow[is.na(toShow)] <- 1
+toShow[toShow > 0.05] <- 1
+toPlot <- -log10(toShow)
+
+heatmaply::heatmaply(data.matrix(toPlot), 
+                     show_dend=c(FALSE, TRUE), 
+                     fontsize_row = 6, 
+                     fontsize_column = 6)  %>%
+  layout(width = 1200)
+```
+
+```{r}
+datatable(toShow <- conservation %>%
+  filter(Project == "AMC")  %>%
+  filter(Condition != "GNT_disease") %>% 
+  filter(Condition != "TSC_disease") %>% 
+   mutate(Project = as.factor(Project),
+          Condition = as.factor(Condition),
+          Module = as.factor(Module))  ,
+          rownames = FALSE,
+          filter = "top",
+          options = list(
+              dom = "tp",
+              pageLength = 6,
+              order = list(list(4, "asc"))),
+          class = "display",
+          escape = FALSE) %>%
+    formatSignif(c("FDR"), digits = 2)
+```
+
+
+# Differential co-expression
+
+To establish which modules are differentially co-expressed between HS and control samples we compare the difference in median R² with the null distribution created by permuting over samples (number of permutations: 10,000).
+
+
+```{r,echo=FALSE,include=TRUE, eval = TRUE}
+if(file.exists(here("Data/06_Modules/TSC/Module-Data/DifferentialCoexpression_TSC.rda"))){
+  load(here("Data/06_Modules/TSC/Module-Data/DifferentialCoexpression_TSC.rda"))
+}else{
+  source("S14-Differential-Coexpression-TSC.R")
+}
+```
+
+<br>
+The table below shows the median R² values for HS and control samples, difference in median R² between the two conditions, and the empirical p-value. 
+<br>
+
+```{r, include = TRUE, eval = TRUE}
+datatable(diffco,
+   rownames=FALSE,
+   colnames = c("Module", "R² control", "R² HS", "Difference", "P-value"),
+   filter = "top",
+   options = list(
+    dom = "tp",
+    pageLength = 6,
+    order = list(list(3, "asc")),
+    autoWidth = TRUE,
+    columnDefs = list(list(width = '150px', targets = c(0)))),
+   elementId=paste0("ModuleNamesShow-", round((10^6)*runif(1)))) %>%
+  formatSignif(2:4, 2) %>%
+  formatSignif(5, 3)
+```
+
+# Causal reasoning {.tabset}
+
+Signal transduction pathways from cell membrane proteins (CMP) to transcription factors (TF) are identified using the MetaBase network and pathway maps.
+
+```{r}
+## Access metabase
+## source("~/Shared/Data-Science/CBDD/metabaseConnection-bel028272.R")
+
+if(file.exists(here("Data/07_CausalReasoning/TSC_regulators_lp.rda"))){
+  load(here("Data/07_CausalReasoning/TSC_regulators_lp.rda"))
+}else{
+  expressedGenes <- rownames(bc_vg[,sampleInfo$GS_RNASEQ_ID])
+  availableObjects <- listBEIDs(
+     bes="Object", sources="MetaBase_object"
+  )
+  availableObjects <- convDfBeIds(
+     availableObjects,
+     idCol="value",
+     from="Object", from.source="MetaBase_object", from.org="human",
+     to="Gene", to.source="Ens_gene",
+     restricted=TRUE, prefFilter=TRUE
+  )
+  availableObjects$available.g <- is.na(availableObjects$conv.to) |
+     availableObjects$conv.to %in% expressedGenes
+  
+  gByO <- availableObjects[which(!is.na(availableObjects$conv.to)),]
+  gByOl <- split(gByO$conv.to, gByO$conv.from)
+  detected <- unique(gByO$conv.to[which(gByO$available.g)])
+  ao <- absentObjects(gByOl, detected = detected)
+  availableObjects$available.o <- ifelse(
+     availableObjects$conv.from %in% ao,
+     FALSE,
+     TRUE
+  )
+  ## 
+  ## miRNA
+  load(here("Data/04_QC/Preprocessing_miRNA.rda"))
+  expressedmiRNA <- mirbase_names %>%
+    filter(ID %in% rownames(bc_mirna))
+  availableObjects_mirna <- listBEIDs(bes="Object", sources="MetaBase_object") %>%
+    filter(value %in% expressedmiRNA$object_id)
+}
+```
+
+## Transcription factors
+
+```{r}
+if(!file.exists(here("Data/07_CausalReasoning/TSC_regulators_lp.rda"))){
+  ## + Available transcription factors ----
+  trTargetsDf <- listBEInteractions(
+     externalKnowledge="MetaBase_regulation",
+     fromUuids = unique(
+        availableObjects$uuid[which(availableObjects$available.o)]
+     ),
+     types=mb.transcription.regulations,
+     organisms="Homo sapiens"
+  )
+  miRNATargetsDf <- listBEInteractions(
+    externalKnowledge="MetaBase_regulation",
+    fromUuids = unique(availableObjects_mirna$uuid),
+    types="miRNA binding",
+    organisms="Homo sapiens"
+  )
+  trTargetsDf <- unique(rbind(trTargetsDf, miRNATargetsDf))
+  tr <- listBEIDs(uuids=unique(trTargetsDf$from))
+  tr <- cbind(tr, getBeIdDescription(
+     tr$value,
+     be="Object", source="MetaBase_object", organism="human"
+  ))
+  
+  ## + Targets of TF ---
+  trTargetsDf <- merge(
+     trTargetsDf,
+     listBEIDs(uuids=unique(trTargetsDf$to)),
+     by.x="to", by.y="uuid"
+  )
+  toAdd <- trTargetsDf[
+     which(trTargetsDf$impact %in% c("Activation", "Inhibition")),
+  ]
+  toAdd$impact <- "Unspecified"
+  trTargetsDfd <- rbind(trTargetsDf, toAdd)
+  trTargets <- lapply(
+     split(trTargetsDfd, trTargetsDfd$impact),
+     function(x){
+        toRet <- lapply(
+           split(x, x$from),
+           function(y){
+              y$value
+           }
+        )
+        scope <- as.list(unique(x[,c("be", "source", "organism.x")]))
+        names(scope) <- c("be", "source", "organism")
+        md <- tr[match(names(toRet), tr$uuid),]
+        rownames(md) <- md$uuid
+        return(BEIDList(
+           l=toRet,
+           metadata=md,
+           scope=scope
+        ))
+        return(toRet)
+     }
+  )
+  trTargets <- lapply(
+     trTargets,
+     focusOnScope,
+     force=TRUE,
+     be="Gene", source="Ens_gene", organism="human"
+  )
+  ## + Causal reasoning by enrichment analysis ----
+  toTest <- rlist::list.flatten(modules.Ensembl)
+  res <- lapply(
+     trTargets,
+     function(x){
+       qrlEnrich(
+         reference=x,
+         query=toTest,
+         omega=expressedGenes,
+         mc.cores=30
+       )
+     }
+  )
+  cr_tf_res <- res
+  ## Add grouping of regulators within each module/impact (regulators are grouped together when they share at least 50% of their targets)
+  fres <- lapply(res,
+                 function(t){
+                   t %>%
+                     filter(FDR <= 0.05)
+                 })
+  fres <- do.call(rbind,
+                     lapply(names(toTest),
+                            function(m){
+                              do.call(rbind,
+                                      lapply(names(fres),
+                                              function(e){
+                                               r <- fres[[e]] %>%
+                                                 filter(q == m) %>%
+                                                 mutate(value = listBEIDs(uuids = r)$value) %>% 
+                                                 arrange(FDR)
+                                               if(!is.null(r) & nrow(r) > 0){
+                                                 if(nrow(r) == 1){
+                                                   r$group <- 1
+                                                   r$impact <- e
+                                                 }else{
+                                                   reg <- apply(r, 1,
+                                                                function(x){intersect(toTest[[m]],
+                                                                                      trTargets[[e]][[x[3]]])
+                                                   })
+                                                   names(reg) <- pull(r, `value`)
+                                                   groups <- lgrouping(reg, distMeth = "jaccard",
+                                                                       hcMeth = "average")
+                                                   r$group <- groups[as.character(r$value)]
+                                                   r$impact <- e
+                                                 }
+                                               }
+                                               return(r)
+                                             }))
+                              }))
+  
+  colnames(fres) <- c(
+     "uuid", "query", "beuuid", "reference", "intersection",
+     "p-value", "FDR", "value", "group", "impact"
+  )
+  fres$direct <- TRUE
+  fres <- do.call(rbind, by(
+     fres,
+     fres$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+   
+  rownames(fres) <- NULL
+  tfregulators <- fres
+}
+```
+
+```{r}
+toShow <- tfregulators %>%
+  as_tibble() %>% 
+  filter(FDR <= 0.05) %>%
+  rename(regulatorID = value) 
+geneDescr <- getBeIdDescription(unique(toShow$regulatorID), be = "Object", 
+                                source = "MetaBase_object", organism = "human")
+
+toShow_tf <- toShow %>%
+  mutate(RegSymbol = geneDescr$symbol[match(regulatorID, geneDescr$id)]) %>%
+  mutate(Regulator = paste0(sprintf('<a href="%s" target="_blank">%s</a>',
+                                    getBeIdURL(regulatorID, databases = "MetaBase_object"),
+                                    RegSymbol)))
+```
+
+The predicted regulators include `r length(unique(grep("mir", toShow_tf$RegSymbol, ignore.case = TRUE, value = TRUE)))` miRNA and `r length(unique(grep("mir", toShow_tf$RegSymbol, ignore.case = TRUE, invert = TRUE, value = TRUE)))` transcription binding factors.
+
+```{r, include= FALSE}
+datatable(toShow_tf %>%
+            filter(!grepl("Unspecified", impact)) %>% 
+            select(Module = uuid,
+                  `Module size` = query,
+                  Regulator,
+                  Effect = impact,
+                  Group = group,
+                  `#Modules`= count,
+                  `# Targets` = reference,
+                  Intersection = intersection,
+                  FDR) %>%
+            mutate(Module = as.factor(Module),
+                   Effect = as.factor(Effect)), 
+          rownames = FALSE,
+          filter = "top",
+          options = list(order = list(8, "asc"),
+                         searchCols = list(NULL, NULL, NULL,
+                                           list(search = '["Activation", "Inhibition"]'),
+                                           NULL, NULL, NULL),
+                         autoWidth = TRUE,
+                         columnDefs = list(list(width = '120px', 
+                                                targets = c(0, 2)))),
+          escape = FALSE) %>%
+  formatSignif(9, digits = 2)
+```
+
+
+## Cell membrane proteins
+
+
+```{r}
+if(!file.exists(here("Data/07_CausalReasoning/TSC_regulators_lp.rda"))){
+  ## + Objects of interest ----
+  cmp <- mb.get.icon.objects(
+     species="human",
+     iconsOfInterest=mb.cellMembrane.icons
+  )
+  cmp <- as.character(cmp)
+  
+  ## + Pathways ----
+  cmp.p <- getBekInteractions(beidValues=cmp, sources="MetaBase_object")
+  cmp <- intersect(cmp, BEIDs(cmp.p)$value)
+  
+  ## + Keeping available objects only ----
+  cmp <- intersect(
+     cmp,
+     availableObjects$conv.from[which(availableObjects$available.o)]
+  )
+  cmp.fp <- filterByBEID(
+     cmp.p,
+     availableObjects$conv.from[which(availableObjects$available.o)],
+     field="value"
+  )
+  
+  ## + Filtering interactions of interest ----
+  cmp.fp <- filterByInteraction(
+     cmp.fp,
+     mb.transduction.mechanisms,
+     field="type"
+  )
+  cmp.fp.mm <- filterByInteraction(
+     cmp.fp,
+     "Homo sapiens",
+     field="organism"
+  )
+  cmp.fp.any <- filterByInteraction(
+    cmp.fp,
+    "any",
+    field="organism"
+  )
+  iToTake <- unique(unlist(lapply(cmp.fp.mm, function(x)x$uuid)))
+  eimm <- unique(unlist(lapply(cmp.fp.mm, function(x)x$externalID)))
+  iToTake <- c(
+    iToTake,
+    unique(unlist(lapply(
+      cmp.fp.any,
+      function(x) x$uuid[which(!x$externalID %in% eimm)]
+    )))
+  )
+  cmp.fp <- filterByInteraction(
+    cmp.fp,
+    iToTake,
+    field="uuid"
+  )
+  
+  ## + Get linear pathways ----
+  cmpuuid <- listBEIDs(
+     values=cmp, be="Object", sources="MetaBase_object", organisms="any"
+  )
+  fromObjects <- intersect(
+     cmpuuid$uuid,
+     unique(unlist(lapply(cmp.fp, function(x) x$from)))
+  )
+  toObjects <- intersect(tr$uuid, BEIDs(cmp.fp)$.uuid)
+  lp <- getLinearPathways(
+     interactionList=cmp.fp,
+     fromIds=fromObjects,
+     toIds=toObjects,
+     mc.cores=20
+  )
+}
+```
+
+```{r}
+if(!file.exists(here("Data/07_CausalReasoning/TSC_regulators_lp.rda"))){
+  ## + Indirect targets of objects of interest ----
+  utfByUpstream <- lp$impact
+  irTargetsDf <- merge(
+     utfByUpstream,
+     trTargetsDf,
+     by.x="to", by.y="from"
+  )
+  irTargetsDf$impact <- ifelse(
+     irTargetsDf$impact.x=="Activation",
+     ifelse(
+        irTargetsDf$impact.y=="Activation",
+        "Activation",
+        ifelse(
+           irTargetsDf$impact.y=="Inhibition",
+           "Inhibition",
+           "Unspecified"
+        )
+     ),
+     ifelse(
+        irTargetsDf$impact.x=="Inhibition",
+        ifelse(
+           irTargetsDf$impact.y=="Activation",
+           "Inhibition",
+           ifelse(
+              irTargetsDf$impact.y=="Inhibition",
+              "Activation",
+              "Unspecified"
+           )
+        ),
+        "Unspecified"
+     )
+  )
+  toAdd <- irTargetsDf[
+     which(irTargetsDf$impact %in% c("Activation", "Inhibition")),
+     ]
+  toAdd$impact <- "Unspecified"
+  irTargetsDfd <- rbind(irTargetsDf, toAdd)
+  irTargets <- lapply(
+     split(irTargetsDfd, irTargetsDfd$impact),
+     function(x){
+        toRet <- lapply(
+           split(x, x$from),
+           function(y){
+              y$value
+           }
+        )
+        scope <- as.list(unique(x[,c("be", "source", "organism.x")]))
+        names(scope) <- c("be", "source", "organism")
+        md <- cmpuuid[match(names(toRet), cmpuuid$uuid),]
+        rownames(md) <- md$uuid
+        return(BEIDList(
+           l=toRet,
+           metadata=md,
+           scope=scope
+        ))
+        return(toRet)
+     }
+  )
+  irTargets <- lapply(
+     irTargets,
+     focusOnScope,
+     force=TRUE,
+     be="Gene", source="Ens_gene", organism="human"
+  )
+  
+  ## + Enrichment analysis ----
+  res <- lapply(
+     irTargets,
+     function(x){
+       qrlEnrich(
+         reference=x,
+         query=toTest,
+         omega=expressedGenes,
+         mc.cores=30
+       )
+     }
+  )
+  cr_cmp_res <- res
+  
+  ## Add grouping of regulators within each module/impact (regulators are grouped together when they share at least 50% of their targets)
+  fres <- lapply(res,
+                 function(t){
+                   t %>%
+                     filter(FDR <= 0.05)
+                 })
+       
+  fres <- do.call(rbind,
+                     lapply(names(toTest),
+                            function(m){
+                              do.call(rbind,
+                                      lapply(names(fres),
+                                             function(e){
+                                               r <- fres[[e]] %>%
+                                                 filter(q == m) %>%
+                                                 mutate(value = listBEIDs(uuids = r)$value) %>%
+                                                 arrange(FDR)
+                                               if(!is.null(r) & nrow(r) > 0){
+                                                 if(nrow(r) == 1){
+                                                   r$group <- 1
+                                                   r$impact <- e
+                                                 }else{
+                                                   reg <- apply(r, 1,
+                                                                function(x){intersect(toTest[[m]],
+                                                                                      irTargets[[e]][[x[3]]])
+                                                   })
+                                                   names(reg) <- pull(r, `value`)
+                                                   groups <- lgrouping(reg, distMeth = "jaccard",
+                                                                       hcMeth = "average")
+                                                   r$group <- groups[as.character(r$value)]
+                                                   r$impact <- e
+                                                 }
+                                               }
+                                               return(r)
+                                             }))
+                              }))
+
+  colnames(fres) <- c(
+     "uuid", "query", "beuuid", "reference", "intersection",
+     "p-value", "FDR", "value", "group", "impact"
+  )
+  
+  fres$direct <- FALSE
+  fres <- do.call(rbind, by(
+     fres,
+     fres$uuid,
+     function(d){
+        d$rank <- rank(-log10(d$"p-value"))
+        d$relRank <- d$rank/max(d$rank, na.rm=TRUE)
+        return(d)
+     }
+  ))
+  
+  ##########################################@
+  ## Target subgroups
+  ## Identify subgroups, when more than 50 targets are allocated to a target group
+  subgr <- fres %>%
+    group_by(uuid, impact) %>%
+    add_count(group) %>%
+    filter(n > 50) %>%
+    ungroup()
+  if(nrow(subgr) > 0){
+    reg <- plyr::compact(sapply(unique(subgr$uuid),
+                                function(m){
+                                  plyr::compact(sapply(
+                                    unique(subgr$impact),
+                                    function(i){
+                                      toRet <- apply(subgr %>% filter(uuid == !!m & impact == !!i), 1,
+                                                     function(x){
+                                                       toRet <- intersect(moduleList[[x["uuid"]]],
+                                                                          irTargets[[x["impact"]]][[x["beuuid"]]])
+                                                       return(toRet)
+                                                     })
+                                      if(!is.null(toRet)){
+                                        names(toRet) <- subgr %>%
+                                          filter(uuid == !!m & impact == !!i) %>%
+                                          pull(value)
+                                      }
+                                      return(toRet)
+                                    }, USE.NAMES = TRUE, simplify = FALSE))
+                                }, USE.NAMES = TRUE, simplify = FALSE))
+    groups <- do.call(rbind, sapply(names(reg),
+                                    function(m){
+                                      do.call(rbind, sapply(names(reg[[m]]),
+                                                            function(i){
+                                                              toRet <- lgrouping(reg[[m]][[i]], sharing = 0.7, distMeth = "jaccard")
+                                                              toRet <- as_tibble(toRet, rownames = NA) %>%
+                                                                mutate_all(~letters[.]) %>%
+                                                                rownames_to_column() %>%
+                                                                mutate(impact = i,
+                                                                       module = m) %>%
+                                                                rename(subgroup = value)
+                                                            }, USE.NAMES = TRUE, simplify = FALSE))
+                                    }, USE.NAMES = TRUE, simplify = FALSE))
+    fres <- fres %>%
+      left_join(groups , by = c("uuid" = "module", "impact", "value" = "rowname"))
+  }else{
+    fres <- fres %>% 
+      mutate(subgroup = NA)
+  }
+  
+  ## Module under regulation
+  cnt <- fres %>% group_by(impact) %>% count(value, name = "count")
+  fres <- fres %>%
+    left_join(cnt,
+              by = c("value", "impact"))
+  
+  rownames(fres) <- NULL
+  cmpregulators = fres
+  save(trTargets, irTargets, irTargetsDfd, tfregulators, cmpregulators, cr_cmp_res, cr_tf_res, cmp.fp,
+       file = here("Data/07_CausalReasoning/TSC_regulators.rda"))
+}
+```
+
+```{r, include = FALSE}
+toShow <- cmpregulators %>%
+  as_tibble() %>% 
+  filter(FDR <= 0.05) %>%
+  rename(regulatorID = value) 
+geneDescr <- getBeIdDescription(unique(toShow$regulatorID), be = "Object", 
+                                source = "MetaBase_object", organism = "human")
+toShow_cmp <- toShow %>%
+  mutate(RegSymbol = geneDescr$symbol[match(regulatorID, geneDescr$id)]) %>%
+  mutate(Regulator = paste0(sprintf('<a href="%s" target="_blank">%s</a>',
+                                    getBeIdURL(regulatorID, databases = "MetaBase_object"),
+                                    RegSymbol)))
+```
+
+The predicted regulators include `r length(unique(toShow_cmp$RegSymbol))` cell membrane proteins. Additional information is available for the regulators on the number of module they are predicted to regulate for each type of impact ("#Modules"). Within each module and impact type, the predicted regulators are clustered to identify regulators sharing downstream targets within the module and impact type. Regulators are clustered together if they share on average 50% of their targets. 
+
+```{r, include = TRUE}
+datatable(toShow_cmp %>%
+            filter(!grepl("Unspecified", impact)) %>% 
+            select(Module = uuid,
+                  `Module size` = query,
+                  Regulator,
+                  Effect = impact,
+                  Group = group,
+                  `#Modules`= count,
+                  `# Targets` = reference,
+                  Intersection = intersection,
+                  FDR)  %>%
+            mutate(Module = as.factor(Module),
+                   Effect = as.factor(Effect)), 
+          rownames = FALSE,
+          filter = "top",
+          options = list(order = list(8, "asc"),
+                         searchCols = list(NULL, NULL, NULL,
+                                           list(search = '["Activation", "Inhibition"]'),
+                                           NULL, NULL, NULL),
+                         autoWidth = TRUE,
+                         columnDefs = list(list(width = '120px', 
+                                                targets = c(0, 2)))),
+          escape = FALSE) %>%
+  formatSignif(9, digits = 2)
+```
+
+
